@@ -1,574 +1,377 @@
-# calibration.py  ─  ShuttleEye v5  ─  Auto + Manual Calibration
+# calibration.py  ─  ShuttleEye  ─  Single Boundary-Line Auto-Calibration
 # ═══════════════════════════════════════════════════════════════════════
 #
-#  AUTO CALIBRATION  (no clicks needed)
-#  ──────────────────────────────────────
-#  1. Scans up to 300 frames, picks the sharpest (Laplacian variance)
-#  2. Runs Canny + HoughLines to find all court lines
-#  3. Computes every pairwise line intersection
-#  4. Clusters nearby intersections (within 20 px) → candidate corners
-#  5. Picks the 4 candidates that best form a rectangle matching the
-#     expected court aspect ratio (W:L = 610:1340)
-#  6. Orders them TL/TR/BR/BL and builds the homography
-#  7. If reprojection error < AUTO_ERR_THRESHOLD → auto-confirms
-#     Otherwise falls back to the interactive manual UI
+#  The camera is assumed to be pointed at ONE painted white boundary line
+#  (not the whole court), e.g. a dedicated line-judge camera. This module:
 #
-#  MANUAL CALIBRATION  (fallback / re-calibrate)
-#  ───────────────────────────────────────────────
-#  • Click to place 4 court corners (TL, TR, BR, BL)
-#  • Drag any placed point to fine-tune
-#  • Scroll wheel nudges ±1 px (Ctrl = ×10)
-#  • Z  toggle snap-to-line-intersection assist
-#  • A/D step one frame back / forward
-#  • B  jump to auto-detected best (sharpest) frame
-#  • R  reset all points
-#  • ENTER confirm & save
-#  • ESC cancel
+#   1. Finds that line automatically — no clicking required in the normal
+#      case. It isolates white pixels (court lines are painted white) that
+#      also form a thin, locally-bright feature (rejects players' white
+#      kit, ad boards, glare — anything broad rather than line-shaped),
+#      then merges collinear Hough segments into a single best line.
+#
+#   2. Works out which side of the line is IN and which is OUT — this
+#      flips depending on where the camera happens to be fixed, so it
+#      can't be hardcoded. The court surface normally fills most of a
+#      line-judge shot, so whichever side's sampled surface colour is
+#      closer to the frame's own dominant colour is taken to be IN; the
+#      minority-colour side is OUT.
+#
+#   3. Only if no line can be found at all (e.g. it's simply not visible
+#      in this footage) does it fall back to a minimal manual UI — click
+#      2 points on the line. Even then, which side is IN is still worked
+#      out automatically from colour, not asked for.
 # ═══════════════════════════════════════════════════════════════════════
 
 import cv2
 import json
 import numpy as np
 import os
-from itertools import combinations
 
 CONFIG_FILE = "court_config.json"
+CONFIG_VERSION = 6   # single-line schema (incompatible with old 4-corner configs)
 
-# ── Official badminton court dimensions (cm) ─────────────────────────
-COURT_W_CM  = 610
-COURT_L_CM  = 1340
-HALF_L      = 670
-SINGLES_OFF = 46
+# Tolerance around the line: a shuttle touching the line counts as IN.
+MARGIN_PX = 4.0
 
-REAL_CORNERS = np.float32([
-    [0,          0         ],
-    [COURT_W_CM, 0         ],
-    [COURT_W_CM, COURT_L_CM],
-    [0,          COURT_L_CM],
-])
+# Ignore candidate lines shorter than this fraction of the frame diagonal —
+# too short to trust as THE boundary line (could be a shoe, a racket edge).
+MIN_LINE_LEN_FRAC = 0.15
 
-# Auto-calibration threshold: accept if mean reprojection error < this
-AUTO_ERR_THRESHOLD = 8.0   # pixels
+# How far off the line (perpendicular, in px) to sample surface colour.
+SAMPLE_OFFSET_PX = 25
+SAMPLE_PATCH     = 9   # odd side length of each colour-sample patch
 
-# ── Module globals ────────────────────────────────────────────────────
-COURT_POINTS = []
-H            = None
-H_INV        = None
+# White court line: low colour saturation, high brightness.
+WHITE_S_MAX = 60
+WHITE_V_MIN = 170
 
-
-# ═══════════════════════════════════════════════════════════════════════
-#  Homography
-# ═══════════════════════════════════════════════════════════════════════
-
-def _build_homography(pixel_corners):
-    global H, H_INV, COURT_POINTS
-    COURT_POINTS = [tuple(int(v) for v in p) for p in pixel_corners]
-    src    = np.float32(pixel_corners)
-    H,    _ = cv2.findHomography(src, REAL_CORNERS, cv2.RANSAC, 5.0)
-    H_INV, _ = cv2.findHomography(REAL_CORNERS, src, cv2.RANSAC, 5.0)
-
-
-def pixel_to_real(px, py):
-    if H is None:
-        return None
-    out = cv2.perspectiveTransform(np.float32([[[px, py]]]), H)
-    return float(out[0][0][0]), float(out[0][0][1])
-
-
-def real_to_pixel(rx, ry):
-    if H_INV is None:
-        return None
-    out = cv2.perspectiveTransform(np.float32([[[rx, ry]]]), H_INV)
-    return int(out[0][0][0]), int(out[0][0][1])
-
-
-def _reprojection_error(pixel_corners):
-    """Mean pixel distance between placed corners and back-projected real corners."""
-    if H is None or H_INV is None:
-        return 999.0, [999.0]*4
-    total = 0.0
-    per_pt = []
-    for i, pc in enumerate(pixel_corners):
-        rc = REAL_CORNERS[i]
-        pp = real_to_pixel(rc[0], rc[1])
-        if pp:
-            e = np.hypot(pp[0]-pc[0], pp[1]-pc[1])
-            total += e
-            per_pt.append(e)
-        else:
-            per_pt.append(999.0)
-    return total / max(len(pixel_corners), 1), per_pt
+# ── Module state (single boundary line) ───────────────────────────────
+LINE_POINT     = None   # np.array([x, y]) — a point on the line
+LINE_DIR       = None   # np.array([dx, dy]) — unit vector along the line
+LINE_NORMAL    = None   # np.array([nx, ny]) — unit vector pointing to the IN side
+LINE_ENDPOINTS = None   # ((x1,y1), (x2,y2)) — visible extent, for drawing
 
 
 # ═══════════════════════════════════════════════════════════════════════
-#  Frame sharpness
+#  White line isolation
 # ═══════════════════════════════════════════════════════════════════════
+
+def _white_line_mask(frame):
+    """
+    Isolate the painted white boundary line using two complementary cues
+    combined with AND, so each cancels the other's false positives:
+
+      1. Colour   — the line is white: low saturation, high brightness.
+                     Alone, this would also match white shirts/shoes, sky,
+                     or bright ad boards.
+      2. Contrast — a top-hat transform keeps only features that are
+                     narrow and brighter than their immediate surroundings.
+                     Alone, this would also match skin, reflections, or any
+                     other locally-bright edge regardless of colour.
+
+    A pixel that is both "white" and "a thin bright feature" is, on a
+    badminton court, a boundary line.
+    """
+    hsv         = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    white_color = cv2.inRange(hsv, (0, 0, WHITE_V_MIN), (180, WHITE_S_MAX, 255))
+
+    gray    = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    blur    = cv2.GaussianBlur(gray, (5, 5), 0)
+    kernel  = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
+    tophat  = cv2.morphologyEx(blur, cv2.MORPH_TOPHAT, kernel)
+    _, contrast_mask = cv2.threshold(tophat, 25, 255, cv2.THRESH_BINARY)
+
+    return cv2.bitwise_and(white_color, contrast_mask)
+
 
 def _sharpness(frame):
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     return cv2.Laplacian(gray, cv2.CV_64F).var()
 
 
-def _best_frame(frames):
-    scores = [(_sharpness(f), i) for i, f in enumerate(frames)]
-    scores.sort(reverse=True)
-    return scores[0][1], scores[0][0]
-
-
 # ═══════════════════════════════════════════════════════════════════════
-#  Line detection & intersection helpers
+#  Segment detection & collinear clustering
 # ═══════════════════════════════════════════════════════════════════════
 
-def _detect_lines(frame):
-    gray  = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    blur  = cv2.GaussianBlur(gray, (5, 5), 0)
-    edges = cv2.Canny(blur, 40, 120, apertureSize=3)
-    lines = cv2.HoughLines(edges, 1, np.pi/180, threshold=70)
-    return lines if lines is not None else []
-
-
-def _line_intersection(r1, t1, r2, t2):
-    ct1, st1 = np.cos(t1), np.sin(t1)
-    ct2, st2 = np.cos(t2), np.sin(t2)
-    det = ct1*st2 - ct2*st1
-    if abs(det) < 1e-6:
-        return None
-    x = (r1*st2 - r2*st1) / det
-    y = (r2*ct1 - r1*ct2) / det
-    return x, y
-
-
-def _all_intersections(hough_lines, frame_shape):
-    h, w = frame_shape[:2]
-    pts = []
-    for i in range(len(hough_lines)):
-        for j in range(i+1, len(hough_lines)):
-            r1, t1 = hough_lines[i][0]
-            r2, t2 = hough_lines[j][0]
-            angle_diff = abs(t1-t2) % np.pi
-            if angle_diff < np.radians(15) or angle_diff > np.radians(165):
-                continue
-            pt = _line_intersection(r1, t1, r2, t2)
-            if pt and -50 < pt[0] < w+50 and -50 < pt[1] < h+50:
-                pts.append(pt)
-    return pts
-
-
-def _cluster_intersections(pts, radius=20):
-    """
-    Merge nearby intersection points into cluster centroids.
-    Returns list of (cx, cy) centroid points.
-    """
-    if not pts:
+def _detect_segments(mask, hough_threshold, min_len):
+    edges = cv2.Canny(mask, 40, 120, apertureSize=3)
+    segs  = cv2.HoughLinesP(edges, 1, np.pi/180, threshold=hough_threshold,
+                             minLineLength=min_len, maxLineGap=25)
+    if segs is None:
         return []
-    visited = [False]*len(pts)
-    clusters = []
-    for i, p in enumerate(pts):
-        if visited[i]:
-            continue
-        group = [p]
-        visited[i] = True
-        for j in range(i+1, len(pts)):
-            if not visited[j]:
-                if np.hypot(pts[j][0]-p[0], pts[j][1]-p[1]) < radius:
-                    group.append(pts[j])
-                    visited[j] = True
-        cx = sum(g[0] for g in group)/len(group)
-        cy = sum(g[1] for g in group)/len(group)
-        clusters.append((cx, cy))
+    return [tuple(int(v) for v in s[0]) for s in segs]
+
+
+def _segment_rho_theta(seg):
+    x1, y1, x2, y2 = seg
+    angle = np.arctan2(y2-y1, x2-x1)
+    theta = (angle + np.pi/2) % np.pi        # perpendicular (normal) angle
+    mx, my = (x1+x2)/2.0, (y1+y2)/2.0
+    rho    = mx*np.cos(theta) + my*np.sin(theta)
+    length = float(np.hypot(x2-x1, y2-y1))
+    return theta, rho, length
+
+
+def _cluster_segments(segs, angle_tol=np.radians(4), rho_tol=15):
+    """Group collinear segments (same angle + same perpendicular offset)."""
+    clusters = []   # each: {theta_sum, rho_sum, count, length, segs}
+    for seg in segs:
+        theta, rho, length = _segment_rho_theta(seg)
+        placed = False
+        for c in clusters:
+            avg_theta = c['theta_sum'] / c['count']
+            avg_rho   = c['rho_sum']   / c['count']
+            dtheta = min(abs(theta-avg_theta), np.pi-abs(theta-avg_theta))
+            if dtheta < angle_tol and abs(rho-avg_rho) < rho_tol:
+                c['theta_sum'] += theta
+                c['rho_sum']   += rho
+                c['count']     += 1
+                c['length']    += length
+                c['segs'].append(seg)
+                placed = True
+                break
+        if not placed:
+            clusters.append({'theta_sum': theta, 'rho_sum': rho,
+                              'count': 1, 'length': length, 'segs': [seg]})
     return clusters
 
 
-def _sort_corners_tl_tr_br_bl(pts):
-    """Sort 4 (x,y) points into [TL, TR, BR, BL] order."""
-    pts = list(pts)
-    cx  = sum(p[0] for p in pts)/4
-    cy  = sum(p[1] for p in pts)/4
-    def quad(p):
-        l = p[0] < cx;  t = p[1] < cy
-        return 0 if (t and l) else 1 if (t and not l) else 2 if (not t and not l) else 3
-    ordered = [None]*4
-    for p in pts:
-        q = quad(p)
-        if ordered[q] is None:
-            ordered[q] = p
-    if any(v is None for v in ordered):
-        return pts  # degenerate, return as-is
-    return ordered
+def _fit_line(segs):
+    """Least-squares line through all segment endpoints; returns the
+    point/direction plus the visible extent (min/max projection)."""
+    pts = []
+    for (x1, y1, x2, y2) in segs:
+        pts.append((x1, y1))
+        pts.append((x2, y2))
+    pts = np.array(pts, dtype=np.float32)
 
+    vx, vy, x0, y0 = cv2.fitLine(pts, cv2.DIST_L2, 0, 0.01, 0.01).flatten()
+    direction = np.array([vx, vy], dtype=np.float64)
+    direction /= np.linalg.norm(direction)
+    point = np.array([x0, y0], dtype=np.float64)
 
-def _score_quad(pts, frame_shape):
-    """
-    Score a set of 4 candidate corners for being a valid court:
-    - prefers larger area
-    - penalises deviation from expected court aspect ratio
-    - penalises non-convexity
-    Returns a score (higher = better); -inf if invalid.
-    """
-    h, w = frame_shape[:2]
-    arr  = np.float32(pts)
-    area = cv2.contourArea(arr)
-    if area < 5000:
-        return -np.inf
-
-    # Convexity check
-    hull = cv2.convexHull(arr)
-    hull_area = cv2.contourArea(hull)
-    if hull_area < 1:
-        return -np.inf
-    convexity = area / hull_area
-    if convexity < 0.85:
-        return -np.inf
-
-    # Aspect ratio of bounding box
-    xs = [p[0] for p in pts];  ys = [p[1] for p in pts]
-    bw = max(xs)-min(xs);      bh = max(ys)-min(ys)
-    if bh < 1:
-        return -np.inf
-
-    expected_ratio = COURT_W_CM / COURT_L_CM   # ~0.455
-    actual_ratio   = bw / bh
-    ratio_error    = abs(actual_ratio - expected_ratio)
-
-    # Score: large area, close aspect ratio, convex
-    score = area * convexity / (1 + ratio_error * 5)
-    return score
+    t = (pts.astype(np.float64) - point) @ direction
+    t_min, t_max = float(t.min()), float(t.max())
+    p1 = point + direction*t_min
+    p2 = point + direction*t_max
+    endpoints = (tuple(int(v) for v in p1), tuple(int(v) for v in p2))
+    return point, direction, t_min, t_max, endpoints
 
 
 # ═══════════════════════════════════════════════════════════════════════
-#  AUTO CALIBRATION
+#  IN/OUT side detection (colour based — camera-placement independent)
 # ═══════════════════════════════════════════════════════════════════════
+
+def _dominant_frame_color(frame, exclude_mask):
+    """
+    Robust dominant colour of the frame, in Lab space, as a stand-in for
+    'the court surface colour' — a line-judge shot is assumed to show
+    mostly court, so the median non-line pixel is the court colour.
+    """
+    lab   = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB)
+    valid = exclude_mask == 0
+    if valid.sum() < 100:
+        return None
+    return np.median(lab[valid].reshape(-1, 3), axis=0)
+
+
+def _sample_side_color(lab, line_mask, point, direction, normal, sign, t_values, offset):
+    half = SAMPLE_PATCH // 2
+    h, w = line_mask.shape[:2]
+    samples = []
+    for t in t_values:
+        base = point + direction*t + normal*sign*offset
+        cx, cy = int(base[0]), int(base[1])
+        if cx-half < 0 or cy-half < 0 or cx+half >= w or cy+half >= h:
+            continue
+        patch      = lab[cy-half:cy+half+1, cx-half:cx+half+1]
+        mask_patch = line_mask[cy-half:cy+half+1, cx-half:cx+half+1]
+        px = patch[mask_patch == 0]
+        if len(px) == 0:
+            continue
+        samples.append(np.median(px.reshape(-1, 3), axis=0))
+    if not samples:
+        return None
+    return np.median(np.array(samples), axis=0)
+
+
+def _determine_in_side(frame, line_mask, point, direction, t_min, t_max):
+    """
+    Returns the unit normal vector pointing toward the IN side, or None
+    if it couldn't be determined (e.g. sample points fall outside frame).
+    """
+    normal   = np.array([-direction[1], direction[0]])
+    t_values = np.linspace(t_min, t_max, 9)[1:-1]   # skip noisy extreme ends
+    lab      = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB)
+
+    color_pos = _sample_side_color(lab, line_mask, point, direction, normal, +1, t_values, SAMPLE_OFFSET_PX)
+    color_neg = _sample_side_color(lab, line_mask, point, direction, normal, -1, t_values, SAMPLE_OFFSET_PX)
+    dominant  = _dominant_frame_color(frame, line_mask)
+    if color_pos is None or color_neg is None or dominant is None:
+        return None
+
+    d_pos = np.linalg.norm(color_pos - dominant)
+    d_neg = np.linalg.norm(color_neg - dominant)
+
+    if abs(d_pos - d_neg) < 3.0:
+        print(f"[Calibration] WARNING: IN/OUT sides look colour-similar "
+              f"(d_pos={d_pos:.1f}, d_neg={d_neg:.1f}) — result may be unreliable.")
+
+    return normal if d_pos <= d_neg else -normal
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  Auto calibration
+# ═══════════════════════════════════════════════════════════════════════
+
+def _score_and_fit(frame, hough_threshold):
+    h, w = frame.shape[:2]
+    diag = float(np.hypot(w, h))
+    mask = _white_line_mask(frame)
+    min_len = max(30, int(w * 0.08))
+
+    segs = _detect_segments(mask, hough_threshold, min_len)
+    if not segs:
+        return None
+
+    clusters = _cluster_segments(segs)
+    if not clusters:
+        return None
+
+    best = max(clusters, key=lambda c: c['length'])
+    if best['length'] < diag * MIN_LINE_LEN_FRAC:
+        return None
+
+    point, direction, t_min, t_max, endpoints = _fit_line(best['segs'])
+    in_normal = _determine_in_side(frame, mask, point, direction, t_min, t_max)
+    if in_normal is None:
+        return None
+
+    return {
+        'point': point, 'direction': direction,
+        't_min': t_min, 't_max': t_max, 'endpoints': endpoints,
+        'in_normal': in_normal, 'length': best['length'],
+    }
+
 
 def auto_calibrate(frames):
     """
-    Try to automatically detect the 4 court corners.
-
-    Returns (corners_list, error) where:
-      corners_list  = [[x,y], [x,y], [x,y], [x,y]] in TL/TR/BR/BL order
-      error         = mean reprojection error in pixels (999 if failed)
-
-    The caller should check error < AUTO_ERR_THRESHOLD to decide
-    whether to accept or fall back to manual.
+    Try to automatically find the boundary line and its IN side.
+    Tries the sharpest frames at several Hough sensitivities, keeping the
+    longest (most confident) line found. Returns a result dict or None.
     """
     print("[AutoCalib] Scanning frames for sharpest …")
-    best_idx, best_score = _best_frame(frames)
-    print(f"[AutoCalib] Best frame #{best_idx}  sharpness={best_score:.0f}")
+    order = sorted(range(len(frames)), key=lambda i: -_sharpness(frames[i]))
+    top_frames = order[:min(5, len(order))]
+    print(f"[AutoCalib] Trying {len(top_frames)} sharpest frames: {top_frames}")
 
-    frame = frames[best_idx]
-    h, w  = frame.shape[:2]
+    best = None
+    for idx in top_frames:
+        frame = frames[idx]
+        w = frame.shape[1]
+        for hough_threshold in (60, 45, 32, 22):
+            result = _score_and_fit(frame, hough_threshold)
+            if result is None:
+                continue
+            if best is None or result['length'] > best['length']:
+                best = result
+            if best['length'] > w * 0.6:
+                break
+        if best is not None and best['length'] > w * 0.6:
+            break
 
-    # ── Detect lines ───────────────────────────────────────────────
-    hough = _detect_lines(frame)
-    if len(hough) < 4:
-        print("[AutoCalib] Too few lines detected. Falling back to manual.")
-        return None, 999.0
-
-    # ── All intersections → cluster → candidate corners ────────────
-    raw_pts  = _all_intersections(hough, frame.shape)
-    clusters = _cluster_intersections(raw_pts, radius=20)
-    print(f"[AutoCalib] {len(raw_pts)} intersections → {len(clusters)} clusters")
-
-    if len(clusters) < 4:
-        print("[AutoCalib] Not enough cluster points. Falling back to manual.")
-        return None, 999.0
-
-    # ── Try every combination of 4 clusters, pick best quad ────────
-    best_score_quad = -np.inf
-    best_corners    = None
-
-    # Limit search to top 30 clusters by distance from frame centre
-    cx_f, cy_f = w/2, h/2
-    clusters_sorted = sorted(clusters, key=lambda p: np.hypot(p[0]-cx_f, p[1]-cy_f))
-    candidates = clusters_sorted[:min(30, len(clusters))]
-
-    for combo in combinations(candidates, 4):
-        s = _score_quad(combo, frame.shape)
-        if s > best_score_quad:
-            best_score_quad = s
-            best_corners    = combo
-
-    if best_corners is None:
-        print("[AutoCalib] No valid quad found. Falling back to manual.")
-        return None, 999.0
-
-    # ── Sort TL/TR/BR/BL, build homography, measure error ─────────
-    corners_sorted = _sort_corners_tl_tr_br_bl(best_corners)
-    _build_homography(corners_sorted)
-    err, _ = _reprojection_error(corners_sorted)
-
-    print(f"[AutoCalib] Reprojection error = {err:.2f} px  (threshold={AUTO_ERR_THRESHOLD})")
-
-    if err < AUTO_ERR_THRESHOLD:
-        print(f"[AutoCalib] ✓ Auto-calibration accepted.")
-        return corners_sorted, err
+    if best is None:
+        print("[AutoCalib] No boundary line found across attempts.")
     else:
-        print(f"[AutoCalib] ✗ Error too high — falling back to manual.")
-        return corners_sorted, err   # return as initial hint for manual UI
+        print(f"[AutoCalib] Best line length={best['length']:.0f}px "
+              f"endpoints={best['endpoints']}")
+    return best
 
 
 # ═══════════════════════════════════════════════════════════════════════
-#  Court line definitions (real-world cm)
+#  Manual fallback (last resort — only the line position is clicked;
+#  the IN side is still determined automatically from colour)
 # ═══════════════════════════════════════════════════════════════════════
 
-def _court_lines_real():
-    W, L, HL, S = COURT_W_CM, COURT_L_CM, HALF_L, SINGLES_OFF
-    cx = W / 2
-    return [
-        (0, 0,    W, 0,    'outer'),
-        (W, 0,    W, L,    'outer'),
-        (W, L,    0, L,    'outer'),
-        (0, L,    0, 0,    'outer'),
-        (S,   0,   S,   L,   'inner'),
-        (W-S, 0,   W-S, L,   'inner'),
-        (0, HL,   W, HL,   'net'),
-        (0, HL-160, W, HL-160, 'inner'),
-        (0, HL+160, W, HL+160, 'inner'),
-        (0,   80,   W,   80,   'inner'),
-        (0, L-80,   W, L-80,   'inner'),
-        (cx, HL,     cx, HL-160, 'inner'),
-        (cx, HL,     cx, HL+160, 'inner'),
-    ]
+def _manual_line_ui(frame):
+    pts = []
+    win = "Calibration (click 2 points on the boundary line)"
+    cv2.namedWindow(win, cv2.WINDOW_NORMAL)
+    cv2.resizeWindow(win, 1280, 760)
 
+    def on_mouse(event, x, y, flags, param):
+        if event == cv2.EVENT_LBUTTONDOWN and len(pts) < 2:
+            pts.append((x, y))
 
-# ═══════════════════════════════════════════════════════════════════════
-#  Drawing helpers
-# ═══════════════════════════════════════════════════════════════════════
+    cv2.setMouseCallback(win, on_mouse)
 
-_LINE_COLOR = {'outer': (255,255,255), 'inner': (160,160,160), 'net': (40,210,210)}
-_LINE_WIDTH = {'outer': 3,             'inner': 1,              'net': 3           }
+    confirmed = False
+    while True:
+        disp = frame.copy()
+        for p in pts:
+            cv2.circle(disp, p, 6, (0, 255, 255), -1)
+        if len(pts) == 2:
+            cv2.line(disp, pts[0], pts[1], (0, 255, 255), 2)
+        cv2.putText(disp, "Click 2 points on the line.  ENTER=confirm  R=reset  ESC=cancel",
+                    (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2)
+        cv2.imshow(win, disp)
+        key = cv2.waitKey(16) & 0xFF
 
-POINT_LABELS      = ["1·TL", "2·TR", "3·BR", "4·BL"]
-POINT_COLORS      = [(0,255,255), (0,200,255), (0,150,255), (0,100,255)]
-POINT_COLORS_GRAB = [(0,255,100),(0,200,100),(0,150,100),(0,100,100)]
+        if key == 13 and len(pts) == 2:
+            confirmed = True
+            break
+        elif key == 27:
+            break
+        elif key == ord('r'):
+            pts = []
 
+    cv2.destroyWindow(win)
+    if not confirmed:
+        return None
 
-def _err_color(e):
-    if e < 1.5:   return (0, 255,  60)
-    if e < 3.0:   return (0, 165, 255)
-    return (0, 60, 255)
+    point = np.array(pts[0], dtype=np.float64)
+    end   = np.array(pts[1], dtype=np.float64)
+    direction = end - point
+    length    = float(np.linalg.norm(direction))
+    direction /= length
+    endpoints = (pts[0], pts[1])
 
+    mask = _white_line_mask(frame)
+    in_normal = _determine_in_side(frame, mask, point, direction, 0.0, length)
+    if in_normal is None:
+        in_normal = np.array([-direction[1], direction[0]])
+        print("[Calibration] WARNING: could not auto-detect the IN side by "
+              "colour — defaulted; verify the IN/OUT overlay looks correct.")
 
-def _draw_court_lines(frame):
-    if H_INV is None:
-        return
-    for (x1r, y1r, x2r, y2r, style) in _court_lines_real():
-        p1 = real_to_pixel(x1r, y1r)
-        p2 = real_to_pixel(x2r, y2r)
-        if p1 and p2:
-            cv2.line(frame, p1, p2, _LINE_COLOR[style], _LINE_WIDTH[style])
-
-
-def _draw_points(frame, pts, grabbed_idx, per_err=None):
-    for i, pt in enumerate(pts):
-        col = POINT_COLORS_GRAB[i] if i == grabbed_idx else POINT_COLORS[i]
-        ec  = _err_color(per_err[i]) if per_err else col
-        cv2.circle(frame, pt, 14, (0,0,0), -1)
-        cv2.circle(frame, pt, 13, ec, 2)
-        cv2.circle(frame, pt, 10, col, 2)
-        cv2.circle(frame, pt,  3, col, -1)
-        lx, ly = pt[0]+15, pt[1]-12
-        cv2.putText(frame, POINT_LABELS[i], (lx+1, ly+1),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0,0,0), 3)
-        cv2.putText(frame, POINT_LABELS[i], (lx, ly),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, col, 2)
-        cv2.putText(frame, f"({pt[0]},{pt[1]})", (lx+1, ly+18),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.42, (0,0,0), 3)
-        cv2.putText(frame, f"({pt[0]},{pt[1]})", (lx, ly+17),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.42, col, 1)
-
-
-def _draw_loupe(frame, base_frame, mouse_xy, zoom=2.5, size=190):
-    mx, my = mouse_xy
-    h, w   = base_frame.shape[:2]
-    half   = int(size / zoom / 2)
-    x1 = max(0, mx-half);  x2 = min(w, mx+half)
-    y1 = max(0, my-half);  y2 = min(h, my+half)
-    if x2-x1 < 4 or y2-y1 < 4:
-        return
-    crop   = base_frame[y1:y2, x1:x2].copy()
-    zoomed = cv2.resize(crop, (size, size), interpolation=cv2.INTER_LANCZOS4)
-    cxz, cyz = size//2, size//2
-    cv2.line(zoomed, (cxz,0), (cxz,size), (0,255,80), 1)
-    cv2.line(zoomed, (0,cyz), (size,cyz), (0,255,80), 1)
-    cv2.circle(zoomed, (cxz,cyz), 5, (0,255,80), 1)
-    px = w-size-10;  py = 10
-    cv2.rectangle(frame, (px-2,py-2), (px+size+2,py+size+2), (180,220,255), 2)
-    frame[py:py+size, px:px+size] = zoomed
-    cv2.putText(frame, f"ZOOM {zoom:.1f}x  ({mx},{my})",
-                (px, py+size+18), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200,200,200), 1)
-
-
-def _snap_to_intersection(x, y, intersections, radius=30):
-    best_d, best_pt = radius, (x, y)
-    for ix, iy in intersections:
-        d = np.hypot(ix-x, iy-y)
-        if d < best_d:
-            best_d  = d
-            best_pt = (int(round(ix)), int(round(iy)))
-    return best_pt
-
-
-def _draw_hud(frame, pts, grabbed_idx, snap_on, frame_idx,
-              total_frames, sharpness, best_idx, err_total, per_err):
-    h, w = frame.shape[:2]
-    bar_y = h - 80
-    overlay = frame.copy()
-    cv2.rectangle(overlay, (0, bar_y), (w, h), (15,15,15), -1)
-    cv2.addWeighted(overlay, 0.82, frame, 0.18, 0, frame)
-
-    instructions = [
-        "Drag=move", "Scroll=nudge Y", "Shift+Scroll=X",
-        f"Z=snap({'ON' if snap_on else 'OFF'})",
-        "A/D=frame  B=best", "R=reset  ENTER=save  ESC=cancel",
-    ]
-    cv2.putText(frame, "  |  ".join(instructions),
-                (10, bar_y+20), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (190,190,190), 1)
-
-    placed = len(pts)
-    if placed < 4:
-        status = f"Place corner {placed+1}/4  →  {POINT_LABELS[placed]}"
-        scol   = (0, 200, 255)
-    else:
-        star   = " ★" if frame_idx == best_idx else ""
-        status = (f"Reprojection: {err_total:.2f} px  "
-                  f"| Frame {frame_idx}/{total_frames-1}{star}  "
-                  f"| Sharpness {sharpness:.0f}")
-        scol   = _err_color(err_total)
-
-    cv2.putText(frame, status, (10, bar_y+48),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.50, scol, 1)
-
-    if placed == 4 and per_err:
-        ex = 10
-        for i, e in enumerate(per_err):
-            lbl = f"{POINT_LABELS[i]}:{e:.1f}px"
-            cv2.putText(frame, lbl, (ex, bar_y+70),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.40, _err_color(e), 1)
-            ex += cv2.getTextSize(lbl, cv2.FONT_HERSHEY_SIMPLEX, 0.40, 1)[0][0]+20
-
-    if grabbed_idx >= 0:
-        cv2.putText(frame, f"Moving: {POINT_LABELS[grabbed_idx]}",
-                    (10, bar_y-10), cv2.FONT_HERSHEY_SIMPLEX, 0.52,
-                    POINT_COLORS_GRAB[grabbed_idx], 2)
+    return {
+        'point': point, 'direction': direction,
+        't_min': 0.0, 't_max': length, 'endpoints': endpoints,
+        'in_normal': in_normal, 'length': length,
+    }
 
 
 # ═══════════════════════════════════════════════════════════════════════
-#  Calibration state machine (manual)
+#  Public entry points
 # ═══════════════════════════════════════════════════════════════════════
 
-class _CalibState:
-    GRAB_RADIUS = 28
+def _apply(result):
+    global LINE_POINT, LINE_DIR, LINE_NORMAL, LINE_ENDPOINTS
+    LINE_POINT     = result['point']
+    LINE_DIR       = result['direction']
+    LINE_NORMAL    = result['in_normal']
+    LINE_ENDPOINTS = result['endpoints']
 
-    def __init__(self, base_frame, hough_lines, initial_pts=None):
-        self.base          = base_frame.copy()
-        self.hough         = hough_lines
-        self.intersections = _all_intersections(hough_lines, base_frame.shape)
-        self.clusters      = _cluster_intersections(self.intersections)
-        self.pts           = [list(p) for p in initial_pts] if initial_pts else []
-        self.grabbed       = -1
-        self.mouse         = (0, 0)
-        self.snap          = True
-        self.frame_idx     = 0
-        self.sharpness     = 0.0
-
-    def on_mouse(self, event, x, y, flags):
-        self.mouse = (x, y)
-        ctrl       = bool(flags & cv2.EVENT_FLAG_CTRLKEY)
-        mult       = 10 if ctrl else 1
-
-        if event == cv2.EVENT_LBUTTONDOWN:
-            for i, p in enumerate(self.pts):
-                if np.hypot(p[0]-x, p[1]-y) < self.GRAB_RADIUS:
-                    self.grabbed = i;  return
-            if len(self.pts) < 4:
-                sx, sy = self._snap(x, y)
-                self.pts.append([sx, sy])
-                if len(self.pts) == 4:
-                    self.pts = [list(p) for p in
-                                _sort_corners_tl_tr_br_bl(self.pts)]
-                self._rebuild()
-
-        elif event == cv2.EVENT_MOUSEMOVE:
-            if self.grabbed >= 0:
-                self.pts[self.grabbed] = [x, y];  self._rebuild()
-
-        elif event == cv2.EVENT_LBUTTONUP:
-            if self.grabbed >= 0:
-                sx, sy = self._snap(x, y)
-                self.pts[self.grabbed] = [sx, sy]
-                if len(self.pts) == 4:
-                    self.pts = [list(p) for p in
-                                _sort_corners_tl_tr_br_bl(self.pts)]
-                self._rebuild()
-                self.grabbed = -1
-
-        elif event == cv2.EVENT_MOUSEWHEEL:
-            idx = self.grabbed if self.grabbed >= 0 else self._nearest(x, y)
-            if 0 <= idx < len(self.pts):
-                self.pts[idx][1] += (-mult if flags > 0 else mult)
-                self._rebuild()
-
-        elif event == cv2.EVENT_MOUSEHWHEEL:
-            idx = self.grabbed if self.grabbed >= 0 else self._nearest(x, y)
-            if 0 <= idx < len(self.pts):
-                self.pts[idx][0] += (mult if flags > 0 else -mult)
-                self._rebuild()
-
-    def _snap(self, x, y):
-        if self.snap and self.clusters:
-            return _snap_to_intersection(x, y, self.clusters, radius=30)
-        return x, y
-
-    def _nearest(self, x, y):
-        best_d, best_i = self.GRAB_RADIUS*2, -1
-        for i, p in enumerate(self.pts):
-            d = np.hypot(p[0]-x, p[1]-y)
-            if d < best_d:
-                best_d, best_i = d, i
-        return best_i
-
-    def _rebuild(self):
-        if len(self.pts) == 4:
-            _build_homography(self.pts)
-
-    def error(self):
-        if len(self.pts) < 4:
-            return 999.0, [999.0]*4
-        return _reprojection_error(self.pts)
-
-    def update_frame(self, frame):
-        self.base          = frame.copy()
-        self.hough         = _detect_lines(frame)
-        self.intersections = _all_intersections(self.hough, frame.shape)
-        self.clusters      = _cluster_intersections(self.intersections)
-        self.sharpness     = _sharpness(frame)
-
-    def render(self, zoom, total_frames, best_idx):
-        frame   = self.base.copy()
-        pts_t   = [tuple(p) for p in self.pts]
-        err, pe = self.error()
-
-        if len(self.pts) == 4:
-            _draw_court_lines(frame)
-        _draw_points(frame, pts_t, self.grabbed, pe if len(self.pts)==4 else None)
-        _draw_loupe(frame, self.base, self.mouse, zoom=zoom)
-        _draw_hud(frame, pts_t, self.grabbed, self.snap,
-                  self.frame_idx, total_frames, self.sharpness, best_idx,
-                  err, pe)
-        return frame
-
-
-# ═══════════════════════════════════════════════════════════════════════
-#  Public calibrate() entry point
-# ═══════════════════════════════════════════════════════════════════════
 
 def calibrate(cap):
     """
-    First tries auto-calibration.
-    If that achieves reprojection error < AUTO_ERR_THRESHOLD, saves and returns True.
-    Otherwise opens the interactive manual UI (with auto result as starting hint).
+    Fully automatic: detects the white boundary line and which side of it
+    is IN, with no user interaction. Only if no line can be found at all
+    in any sampled frame does a minimal manual UI open (click 2 points on
+    the line) — and even then, the IN side is still worked out from
+    colour automatically, never asked for.
     """
-    print("\n[Calibration v5] ──────────────────────────────────────────")
+    print("\n[Calibration] ──────────────────────────────────────────")
     print("  Loading frames …")
 
     frames = []
@@ -581,79 +384,77 @@ def calibrate(cap):
     if not frames:
         raise RuntimeError("No frames available for calibration.")
 
-    best_idx, best_sharp = _best_frame(frames)
+    result = auto_calibrate(frames)
 
-    # ── Try auto ─────────────────────────────────────────────────
-    auto_corners, auto_err = auto_calibrate(frames)
-
-    if auto_corners is not None and auto_err < AUTO_ERR_THRESHOLD:
+    if result is not None:
+        _apply(result)
         _save()
-        print(f"[Calibration] Auto-calibration complete  (error={auto_err:.2f} px)\n")
+        print(f"[Calibration] Auto-calibration complete "
+              f"(line length={result['length']:.0f}px)\n")
         cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
         return True
 
-    # ── Fall back to manual UI ────────────────────────────────────
-    print("[Calibration] Opening manual UI …")
-    print("  Drag corners. Z=snap  A/D=frame  B=best  ENTER=save  ESC=cancel\n")
+    # ── Last resort: no line detected in any frame at all ──────────
+    print("[Calibration] Could not detect any boundary line automatically.")
+    print("[Calibration] Opening manual UI …\n")
 
-    frame_idx = best_idx
-    zoom      = 2.5
+    best_idx = int(np.argmax([_sharpness(f) for f in frames]))
+    result = _manual_line_ui(frames[best_idx])
 
-    cv2.namedWindow("Calibration", cv2.WINDOW_NORMAL)
-    cv2.resizeWindow("Calibration", 1280, 760)
-
-    # Use auto corners as initial hint if available (even if error was high)
-    state = _CalibState(
-        frames[frame_idx],
-        _detect_lines(frames[frame_idx]),
-        initial_pts=auto_corners
-    )
-    state.frame_idx  = frame_idx
-    state.sharpness  = best_sharp
-
-    cv2.setMouseCallback("Calibration",
-                         lambda e, x, y, f, p: state.on_mouse(e, x, y, f))
-
-    confirmed = False
-    while True:
-        frame = state.render(zoom, len(frames), best_idx)
-        cv2.imshow("Calibration", frame)
-        key = cv2.waitKey(16) & 0xFF
-
-        if key == 13:    # ENTER
-            if len(state.pts) == 4:
-                confirmed = True;  break
-            else:
-                print(f"  [!] Need 4 corners, only {len(state.pts)} placed.")
-        elif key == 27:  print("[Calibration] Cancelled."); break
-        elif key == ord('r'):
-            state.pts = [];  state.grabbed = -1
-            print("[Calibration] Points reset.")
-        elif key == ord('z'):
-            state.snap = not state.snap
-            print(f"[Calibration] Snap {'ON' if state.snap else 'OFF'}")
-        elif key == ord('b'):
-            frame_idx = best_idx;  state.frame_idx = frame_idx
-            state.update_frame(frames[frame_idx])
-        elif key == ord('a'):
-            frame_idx = max(0, frame_idx-1);  state.frame_idx = frame_idx
-            state.update_frame(frames[frame_idx])
-        elif key == ord('d'):
-            frame_idx = min(len(frames)-1, frame_idx+1);  state.frame_idx = frame_idx
-            state.update_frame(frames[frame_idx])
-        elif key in (ord('+'), ord('=')):  zoom = min(zoom+0.5, 8.0)
-        elif key in (ord('-'), ord('_')):  zoom = max(zoom-0.5, 1.5)
-
-    cv2.destroyWindow("Calibration")
-
-    if confirmed:
-        _build_homography(state.pts)
+    ok = result is not None
+    if ok:
+        _apply(result)
         _save()
-        err, pe = _reprojection_error(state.pts)
-        print(f"[Calibration] Saved. Error={err:.2f} px  per-pt={[f'{e:.2f}' for e in pe]}\n")
+        print(f"[Calibration] Manual line saved (length={result['length']:.0f}px)\n")
+    else:
+        print("[Calibration] Cancelled.\n")
 
     cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-    return confirmed
+    return ok
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  Runtime classification
+# ═══════════════════════════════════════════════════════════════════════
+
+def is_calibrated():
+    return LINE_POINT is not None
+
+
+def classify_side(px, py):
+    """Returns "IN" | "OUT" | None (not calibrated)."""
+    if LINE_POINT is None:
+        return None
+    v = np.array([px, py], dtype=np.float64) - LINE_POINT
+    signed = float(v @ LINE_NORMAL)
+    return "IN" if signed >= -MARGIN_PX else "OUT"
+
+
+def line_offsets(px, py):
+    """Returns (perp_dist_from_line_px, along_line_px), signed toward IN, or None."""
+    if LINE_POINT is None:
+        return None
+    v = np.array([px, py], dtype=np.float64) - LINE_POINT
+    perp  = float(v @ LINE_NORMAL)
+    along = float(v @ LINE_DIR)
+    return perp, along
+
+
+def draw_court(frame):
+    """Draws the boundary line and IN/OUT side labels."""
+    if LINE_POINT is None:
+        return frame
+
+    p1, p2 = LINE_ENDPOINTS
+    cv2.line(frame, p1, p2, (0, 255, 255), 3)
+
+    mid = np.array([(p1[0]+p2[0])/2.0, (p1[1]+p2[1])/2.0])
+    in_pt  = tuple(int(v) for v in (mid + LINE_NORMAL*40))
+    out_pt = tuple(int(v) for v in (mid - LINE_NORMAL*40))
+
+    cv2.putText(frame, "IN",  in_pt,  cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0),   2)
+    cv2.putText(frame, "OUT", out_pt, cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 60, 255), 2)
+    return frame
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -661,8 +462,15 @@ def calibrate(cap):
 # ═══════════════════════════════════════════════════════════════════════
 
 def _save():
+    data = {
+        "point":     LINE_POINT.tolist(),
+        "direction": LINE_DIR.tolist(),
+        "in_normal": LINE_NORMAL.tolist(),
+        "endpoints": [list(LINE_ENDPOINTS[0]), list(LINE_ENDPOINTS[1])],
+        "version":   CONFIG_VERSION,
+    }
     with open(CONFIG_FILE, "w") as f:
-        json.dump({"court_points": COURT_POINTS, "version": 5}, f, indent=2)
+        json.dump(data, f, indent=2)
     print(f"[Calibration] Config saved → {CONFIG_FILE}")
 
 
@@ -671,17 +479,14 @@ def load_court_points():
         return False
     with open(CONFIG_FILE) as f:
         data = json.load(f)
-    pts = [tuple(p) for p in data["court_points"]]
-    _build_homography(pts)
-    err, _ = _reprojection_error(pts)
-    print(f"[Calibration] Loaded  (reproj error={err:.2f} px)")
+    if data.get("version") != CONFIG_VERSION:
+        print("[Calibration] Config is an older/incompatible format — recalibrating.")
+        return False
+
+    global LINE_POINT, LINE_DIR, LINE_NORMAL, LINE_ENDPOINTS
+    LINE_POINT     = np.array(data["point"], dtype=np.float64)
+    LINE_DIR       = np.array(data["direction"], dtype=np.float64)
+    LINE_NORMAL    = np.array(data["in_normal"], dtype=np.float64)
+    LINE_ENDPOINTS = (tuple(data["endpoints"][0]), tuple(data["endpoints"][1]))
+    print("[Calibration] Loaded boundary line from config.")
     return True
-
-
-# ═══════════════════════════════════════════════════════════════════════
-#  Runtime drawing
-# ═══════════════════════════════════════════════════════════════════════
-
-def draw_court(frame):
-    _draw_court_lines(frame)
-    return frame

@@ -1,9 +1,9 @@
-# line_judge.py  ─  ShuttleEye v5
+# line_judge.py  ─  ShuttleEye
 # ═══════════════════════════════════════════════════════════════════
-#  Judges IN / OUT in real-world court space (centimetres).
+#  Judges IN / OUT relative to the single detected boundary line
+#  (see calibration.py — classify_side() owns the IN/OUT geometry
+#  and the margin tolerance for "touching the line counts as IN").
 #
-#  CHANGES FROM v4
-#  ───────────────
 #  • All drawing / banner code removed — the Umpire Dashboard owns UI
 #  • Decisions are pushed to an optional callback (on_decision) AND to
 #    an internal deque so the dashboard can poll them
@@ -20,7 +20,6 @@ import calibration
 class LineJudge:
 
     DISPLAY_DURATION = 60    # frames the CV overlay stays visible
-    MARGIN_CM        = 2.0   # cm tolerance — anything within 2 cm of line → IN
 
     def __init__(self, on_decision=None):
         """
@@ -45,34 +44,28 @@ class LineJudge:
         """
         if landing_px is None:
             return None
-        if calibration.H is None:
+        decision = calibration.classify_side(*landing_px)
+        if decision is None:
             print("[LineJudge] WARNING: not calibrated.")
             return None
 
-        cm = calibration.pixel_to_real(*landing_px)
-        if cm is None:
-            return None
-        rx, ry = cm
-
-        decision = self._classify(rx, ry)
+        # Signed pixel offsets from the line (perp, along) — kept in the
+        # same "cm" slot the dashboard expects for display purposes only;
+        # there's no real-world scale for a single line without a second
+        # reference dimension, so these are pixel offsets, not centimetres.
+        offs = calibration.line_offsets(*landing_px) or (0.0, 0.0)
 
         self.last_decision   = decision
         self.last_landing_px = landing_px
-        self.last_landing_cm = (rx, ry)
+        self.last_landing_cm = offs
         self.display_counter = self.DISPLAY_DURATION
-        self.history.append((decision, (rx, ry)))
-        self._pending.append((decision, (rx, ry), landing_px))
+        self.history.append((decision, offs))
+        self._pending.append((decision, offs, landing_px))
 
         if self.on_decision:
-            self.on_decision(decision, (rx, ry), landing_px)
+            self.on_decision(decision, offs, landing_px)
 
         return decision
-
-    def _classify(self, rx, ry):
-        m = self.MARGIN_CM
-        W = calibration.COURT_W_CM
-        L = calibration.COURT_L_CM
-        return "IN" if (-m <= rx <= W+m and -m <= ry <= L+m) else "OUT"
 
     # ── Poll interface (for dashboard) ───────────────────────────
 
@@ -111,8 +104,8 @@ class LineJudge:
             # Small verdict tag next to marker
             label = self.last_decision
             if self.last_landing_cm:
-                rx, ry = self.last_landing_cm
-                label += f"  {rx:.0f},{ry:.0f}cm"
+                dist = self.last_landing_cm[0]
+                label += f"  {dist:+.0f}px"
             cv2.putText(frame, label, (px[0]+18, px[1]-14),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0,0,0), 4)
             cv2.putText(frame, label, (px[0]+18, px[1]-14),
