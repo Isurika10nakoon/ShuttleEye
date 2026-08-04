@@ -6,22 +6,33 @@
 #  C   re-calibrate  (manual override)
 #  P   pause / resume
 #  D   toggle debug HUD
+#  F   toggle fullscreen
 #  S   print session stats to console
 # ═══════════════════════════════════════════════════════════════════
 
 import cv2
 import time
 import os
+import sys
 
 from shuttle_detection  import ShuttleDetector
 from landing_detection  import LandingDetector
 from line_judge         import LineJudge
 from umpire_dashboard   import UmpireDashboard
+from login_window       import run_login_flow
 import calibration
 
 # ── Config ───────────────────────────────────────────────────────
 VIDEO_SOURCE = "videos/test1.mp4"  # 0 for webcam
 # ─────────────────────────────────────────────────────────────────
+
+# ── Login (blocks in main thread until a valid session is chosen) ─
+session = run_login_flow()
+if session is None:
+    print("[ShuttleEye] Login cancelled. Exiting.")
+    sys.exit(0)
+umpire_name, role = session
+print(f"[ShuttleEye] Logged in as '{umpire_name}' ({role})")
 
 cap = cv2.VideoCapture(VIDEO_SOURCE)
 cap.set(cv2.CAP_PROP_FRAME_WIDTH,  1280)
@@ -34,7 +45,7 @@ if not calibration.load_court_points():
     calibration.calibrate(cap)   # tries auto → falls back to manual
 
 # ── Umpire dashboard ──────────────────────────────────────────────
-dashboard = UmpireDashboard()
+dashboard = UmpireDashboard(umpire_name=umpire_name, role=role)
 dashboard.start()   # runs in background thread; non-blocking
 
 # ── Core components ───────────────────────────────────────────────
@@ -50,9 +61,13 @@ judge   = LineJudge(on_decision=_on_decision)
 prev_time  = time.time()
 paused     = False
 show_debug = False
+fullscreen = False
+
+WINDOW_NAME = "ShuttleEye"
+cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
 
 print("\n[ShuttleEye v5] Running")
-print("  Q=quit  C=calibrate  P=pause  D=debug  S=stats\n")
+print("  Q=quit  C=calibrate  P=pause  D=debug  F=fullscreen  S=stats\n")
 
 
 def _draw_debug(frame, lander):
@@ -95,6 +110,13 @@ while True:
     elif key == ord('d'):
         show_debug = not show_debug
         print("[ShuttleEye] Debug", "ON" if show_debug else "OFF")
+
+    elif key == ord('f'):
+        fullscreen = not fullscreen
+        cv2.setWindowProperty(
+            WINDOW_NAME, cv2.WND_PROP_FULLSCREEN,
+            cv2.WINDOW_FULLSCREEN if fullscreen else cv2.WINDOW_NORMAL)
+        print("[ShuttleEye] Fullscreen", "ON" if fullscreen else "OFF")
 
     elif key == ord('s'):
         total, ins, outs = judge.get_stats()
@@ -143,20 +165,8 @@ while True:
 
     cv2.putText(frame, f"FPS: {int(fps)}",
                 (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1, (0,255,0), 2)
-    cv2.putText(frame, "ShuttleEye v5",
+    cv2.putText(frame, "ShuttleEye",
                 (20, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,255,255), 2)
-
-    # Score mirror from dashboard
-    a, b = dashboard.score_a, dashboard.score_b
-    cv2.putText(frame, f"{dashboard.name_a} {a} – {b} {dashboard.name_b}",
-                (20, 116), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255,220,80), 2)
-
-    if shuttle_pos:
-        cm_pos = calibration.pixel_to_real(*shuttle_pos)
-        if cm_pos:
-            cv2.putText(frame,
-                        f"Shuttle: px{shuttle_pos} ({cm_pos[0]:.0f},{cm_pos[1]:.0f})cm",
-                        (20, 148), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0,255,255), 2)
 
     if show_debug:
         _draw_debug(frame, lander)
