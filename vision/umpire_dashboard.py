@@ -1,7 +1,7 @@
 # umpire_dashboard.py  ─  ShuttleEye v5  ─  Umpire Scoring Dashboard
 # ═══════════════════════════════════════════════════════════════════════
 #
-#  A professional Tkinter umpire dashboard that:
+#  A professional CustomTkinter umpire dashboard that:
 #  • Shows live score for both players / teams
 #  • Tracks sets (games) with full set history
 #  • Receives IN/OUT decisions from line_judge via callback
@@ -13,12 +13,13 @@
 #  • Serve indicator (which side is serving)
 #  • Match timer
 #  • Export rally log to text file
+#  • Shows which logged-in umpire is running the match
 #  • Runs in its own thread — non-blocking to the CV loop
 #
 #  USAGE
 #  ─────
 #  from umpire_dashboard import UmpireDashboard
-#  dash = UmpireDashboard()
+#  dash = UmpireDashboard(umpire_name="Jane Doe", role="umpire")
 #  dash.start()                          # opens window in background thread
 #
 #  # From line_judge callback or app loop:
@@ -32,17 +33,22 @@
 # ═══════════════════════════════════════════════════════════════════════
 
 import tkinter as tk
-from tkinter import ttk, messagebox, filedialog
+from tkinter import messagebox, filedialog
+import customtkinter as ctk
 import threading
 import time
 import datetime
 import queue
+
+ctk.set_appearance_mode("dark")
+ctk.set_default_color_theme("blue")
 
 
 # ── Colour palette ────────────────────────────────────────────────────
 BG          = "#0d1117"
 BG2         = "#161b22"
 BG3         = "#21262d"
+BG4         = "#282e37"
 BORDER      = "#30363d"
 TEXT        = "#e6edf3"
 TEXT_DIM    = "#8b949e"
@@ -55,11 +61,13 @@ WHITE       = "#ffffff"
 SCORE_A_COL = "#58a6ff"
 SCORE_B_COL = "#f0883e"
 
+FONT_FAMILY = "Segoe UI"
+
 
 class UmpireDashboard:
     """
     Umpire scoring dashboard.
-    Runs Tkinter in a dedicated daemon thread so it never blocks the CV loop.
+    Runs CustomTkinter in a dedicated daemon thread so it never blocks the CV loop.
     """
 
     WINNING_SCORE  = 21
@@ -68,10 +76,14 @@ class UmpireDashboard:
     BEST_OF        = 3          # match is best of 3 sets
     CHALLENGES_PER_SET = 2
 
-    def __init__(self):
+    def __init__(self, umpire_name="Umpire", role="umpire"):
         self._q      = queue.Queue()   # thread-safe event queue
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._root   = None
+
+        # Session / login info
+        self.umpire_name = umpire_name
+        self.role        = role
 
         # Match state
         self.score_a    = 0
@@ -107,7 +119,9 @@ class UmpireDashboard:
         """
         Called by line_judge callback or app loop.
         decision: "IN" or "OUT"
-        cm: (rx, ry) real-world centimetres
+        cm: (perp_dist_px, along_line_px) — signed pixel offsets from the
+            boundary line (named "cm" for historical/interface reasons;
+            there's no real-world scale for a single line)
         px: (px, py) pixel coordinates
         """
         self._q.put(("DECISION", (decision, cm, px)))
@@ -121,11 +135,11 @@ class UmpireDashboard:
     # ═══════════════════════════════════════════════════════════════
 
     def _run(self):
-        self._root = tk.Tk()
+        self._root = ctk.CTk()
         self._root.title("ShuttleEye  ─  Umpire Dashboard")
-        self._root.configure(bg=BG)
-        self._root.geometry("1000x760")
-        self._root.resizable(True, True)
+        self._root.configure(fg_color=BG)
+        self._root.geometry("1040x780")
+        self._root.minsize(920, 680)
         self._root.protocol("WM_DELETE_WINDOW", self._on_close)
 
         self._build_ui()
@@ -144,32 +158,44 @@ class UmpireDashboard:
         root = self._root
 
         # ── Top title bar ─────────────────────────────────────────
-        title_bar = tk.Frame(root, bg=BG, pady=6)
+        title_bar = ctk.CTkFrame(root, fg_color=BG, corner_radius=0, height=52)
         title_bar.pack(fill="x")
+        title_bar.pack_propagate(False)
 
-        tk.Label(title_bar, text="🏸  ShuttleEye Umpire Dashboard",
-                 font=("Helvetica", 16, "bold"),
-                 fg=CYAN, bg=BG).pack(side="left", padx=16)
+        ctk.CTkLabel(title_bar, text="🏸  ShuttleEye Umpire Dashboard",
+                     font=(FONT_FAMILY, 18, "bold"),
+                     text_color=CYAN, fg_color="transparent").pack(side="left", padx=18)
+
+        role_badge = "ADMIN" if self.role == "admin" else "UMPIRE"
+        badge_col  = YELLOW if self.role == "admin" else GREEN
+        user_frame = ctk.CTkFrame(title_bar, fg_color=BG3, corner_radius=8)
+        user_frame.pack(side="right", padx=16, pady=8)
+        ctk.CTkLabel(user_frame, text=f"👤 {self.umpire_name}",
+                     font=(FONT_FAMILY, 12, "bold"), text_color=TEXT,
+                     fg_color="transparent").pack(side="left", padx=(12, 6), pady=4)
+        ctk.CTkLabel(user_frame, text=role_badge,
+                     font=(FONT_FAMILY, 10, "bold"), text_color=badge_col,
+                     fg_color="transparent").pack(side="left", padx=(0, 12), pady=4)
 
         self._timer_var = tk.StringVar(value="00:00")
-        tk.Label(title_bar, textvariable=self._timer_var,
-                 font=("Courier", 14, "bold"),
-                 fg=TEXT_DIM, bg=BG).pack(side="right", padx=16)
+        ctk.CTkLabel(title_bar, textvariable=self._timer_var,
+                     font=("Consolas", 15, "bold"),
+                     text_color=TEXT_DIM, fg_color="transparent").pack(side="right", padx=8)
 
         tk.Frame(root, bg=BORDER, height=1).pack(fill="x")
 
         # ── Main body split ───────────────────────────────────────
-        body = tk.Frame(root, bg=BG)
+        body = ctk.CTkFrame(root, fg_color=BG, corner_radius=0)
         body.pack(fill="both", expand=True, padx=0, pady=0)
 
-        left  = tk.Frame(body, bg=BG, width=540)
-        left.pack(side="left", fill="both", expand=True, padx=8, pady=8)
+        left  = ctk.CTkFrame(body, fg_color=BG, corner_radius=0, width=560)
+        left.pack(side="left", fill="both", expand=True, padx=10, pady=10)
         left.pack_propagate(False)
 
         tk.Frame(body, bg=BORDER, width=1).pack(side="left", fill="y")
 
-        right = tk.Frame(body, bg=BG, width=450)
-        right.pack(side="right", fill="both", padx=8, pady=8)
+        right = ctk.CTkFrame(body, fg_color=BG, corner_radius=0, width=440)
+        right.pack(side="right", fill="both", padx=10, pady=10)
         right.pack_propagate(False)
 
         self._build_left(left)
@@ -180,18 +206,19 @@ class UmpireDashboard:
     def _build_left(self, parent):
 
         # Player name row
-        name_row = tk.Frame(parent, bg=BG)
+        name_row = ctk.CTkFrame(parent, fg_color="transparent")
         name_row.pack(fill="x", pady=(4, 0))
 
-        tk.Label(name_row, text="Player / Team names:", fg=TEXT_DIM,
-                 bg=BG, font=("Helvetica", 10)).pack(side="left")
-        tk.Button(name_row, text="✏  Edit", command=self._edit_names,
-                  fg=CYAN, bg=BG3, bd=0, padx=8, pady=2,
-                  font=("Helvetica", 9)).pack(side="right")
+        ctk.CTkLabel(name_row, text="Player / Team names:", text_color=TEXT_DIM,
+                     fg_color="transparent", font=(FONT_FAMILY, 11)).pack(side="left")
+        ctk.CTkButton(name_row, text="✏  Edit", command=self._edit_names,
+                      text_color=CYAN, fg_color=BG3, hover_color=BG4,
+                      corner_radius=8, width=70, height=26,
+                      font=(FONT_FAMILY, 10)).pack(side="right")
 
         # ── Scoreboard ────────────────────────────────────────────
-        sb = tk.Frame(parent, bg=BG2, bd=0, relief="flat")
-        sb.pack(fill="x", pady=6)
+        sb = ctk.CTkFrame(parent, fg_color=BG2, corner_radius=14)
+        sb.pack(fill="x", pady=8)
         sb.columnconfigure(0, weight=1)
         sb.columnconfigure(1, weight=0)
         sb.columnconfigure(2, weight=1)
@@ -200,88 +227,94 @@ class UmpireDashboard:
         self._name_a_var = tk.StringVar(value=self.name_a)
         self._name_b_var = tk.StringVar(value=self.name_b)
 
-        tk.Label(sb, textvariable=self._name_a_var,
-                 fg=SCORE_A_COL, bg=BG2,
-                 font=("Helvetica", 15, "bold")).grid(row=0, column=0, pady=(12,0))
-        tk.Label(sb, text="vs",
-                 fg=TEXT_DIM, bg=BG2,
-                 font=("Helvetica", 12)).grid(row=0, column=1, pady=(12,0))
-        tk.Label(sb, textvariable=self._name_b_var,
-                 fg=SCORE_B_COL, bg=BG2,
-                 font=("Helvetica", 15, "bold")).grid(row=0, column=2, pady=(12,0))
+        ctk.CTkLabel(sb, textvariable=self._name_a_var,
+                     text_color=SCORE_A_COL, fg_color="transparent",
+                     font=(FONT_FAMILY, 16, "bold")).grid(row=0, column=0, pady=(16, 0))
+        ctk.CTkLabel(sb, text="vs",
+                     text_color=TEXT_DIM, fg_color="transparent",
+                     font=(FONT_FAMILY, 12)).grid(row=0, column=1, pady=(16, 0))
+        ctk.CTkLabel(sb, textvariable=self._name_b_var,
+                     text_color=SCORE_B_COL, fg_color="transparent",
+                     font=(FONT_FAMILY, 16, "bold")).grid(row=0, column=2, pady=(16, 0))
 
         # Big score numbers
         self._score_a_var = tk.StringVar(value="0")
         self._score_b_var = tk.StringVar(value="0")
 
-        self._score_a_label = tk.Label(sb, textvariable=self._score_a_var,
-                 fg=SCORE_A_COL, bg=BG2,
-                 font=("Helvetica", 80, "bold"))
-        self._score_a_label.grid(row=1, column=0, padx=20, pady=4)
+        self._score_a_label = ctk.CTkLabel(sb, textvariable=self._score_a_var,
+                 text_color=SCORE_A_COL, fg_color="transparent",
+                 font=(FONT_FAMILY, 84, "bold"))
+        self._score_a_label.grid(row=1, column=0, padx=20, pady=6)
 
-        tk.Label(sb, text="—", fg=TEXT_DIM, bg=BG2,
-                 font=("Helvetica", 36)).grid(row=1, column=1)
+        ctk.CTkLabel(sb, text="—", text_color=TEXT_DIM, fg_color="transparent",
+                     font=(FONT_FAMILY, 36)).grid(row=1, column=1)
 
-        self._score_b_label = tk.Label(sb, textvariable=self._score_b_var,
-                 fg=SCORE_B_COL, bg=BG2,
-                 font=("Helvetica", 80, "bold"))
-        self._score_b_label.grid(row=1, column=2, padx=20, pady=4)
+        self._score_b_label = ctk.CTkLabel(sb, textvariable=self._score_b_var,
+                 text_color=SCORE_B_COL, fg_color="transparent",
+                 font=(FONT_FAMILY, 84, "bold"))
+        self._score_b_label.grid(row=1, column=2, padx=20, pady=6)
 
         # Serve indicator
         self._serve_var = tk.StringVar(value=f"🏸  Serving: {self.name_a}")
-        tk.Label(sb, textvariable=self._serve_var,
-                 fg=YELLOW, bg=BG2,
-                 font=("Helvetica", 11)).grid(row=2, column=0, columnspan=3, pady=(0,4))
+        ctk.CTkLabel(sb, textvariable=self._serve_var,
+                     text_color=YELLOW, fg_color="transparent",
+                     font=(FONT_FAMILY, 12)).grid(row=2, column=0, columnspan=3, pady=(0, 4))
 
         # Deuce / status
         self._status_var = tk.StringVar(value="")
-        self._status_lbl = tk.Label(sb, textvariable=self._status_var,
-                 fg=YELLOW, bg=BG2,
-                 font=("Helvetica", 13, "bold"))
-        self._status_lbl.grid(row=3, column=0, columnspan=3, pady=(0, 8))
+        self._status_lbl = ctk.CTkLabel(sb, textvariable=self._status_var,
+                 text_color=YELLOW, fg_color="transparent",
+                 font=(FONT_FAMILY, 14, "bold"))
+        self._status_lbl.grid(row=3, column=0, columnspan=3, pady=(0, 12))
 
         # ── Set history ───────────────────────────────────────────
-        set_frame = tk.Frame(parent, bg=BG3, bd=0)
-        set_frame.pack(fill="x", pady=4, ipady=6, ipadx=8)
+        set_frame = ctk.CTkFrame(parent, fg_color=BG3, corner_radius=12)
+        set_frame.pack(fill="x", pady=5, ipady=6)
 
-        tk.Label(set_frame, text="SET HISTORY",
-                 fg=TEXT_DIM, bg=BG3,
-                 font=("Helvetica", 9, "bold")).pack(anchor="w", padx=8)
+        ctk.CTkLabel(set_frame, text="SET HISTORY",
+                     text_color=TEXT_DIM, fg_color="transparent",
+                     font=(FONT_FAMILY, 10, "bold")).pack(anchor="w", padx=12, pady=(6, 0))
 
         self._sets_var = tk.StringVar(value="–")
-        tk.Label(set_frame, textvariable=self._sets_var,
-                 fg=TEXT, bg=BG3,
-                 font=("Courier", 11)).pack(anchor="w", padx=8)
+        ctk.CTkLabel(set_frame, textvariable=self._sets_var,
+                     text_color=TEXT, fg_color="transparent",
+                     font=("Consolas", 12)).pack(anchor="w", padx=12, pady=(0, 4))
 
         # Sets won row
-        sw = tk.Frame(parent, bg=BG)
-        sw.pack(fill="x", pady=2)
+        sw = ctk.CTkFrame(parent, fg_color="transparent")
+        sw.pack(fill="x", pady=3)
 
-        tk.Label(sw, text="Sets won:", fg=TEXT_DIM, bg=BG,
-                 font=("Helvetica", 10)).pack(side="left")
+        ctk.CTkLabel(sw, text="Sets won:", text_color=TEXT_DIM, fg_color="transparent",
+                     font=(FONT_FAMILY, 11)).pack(side="left")
         self._sets_won_var = tk.StringVar(value="A: 0   B: 0")
-        tk.Label(sw, textvariable=self._sets_won_var,
-                 fg=TEXT, bg=BG, font=("Helvetica", 10, "bold")).pack(side="left", padx=8)
+        ctk.CTkLabel(sw, textvariable=self._sets_won_var,
+                     text_color=TEXT, fg_color="transparent",
+                     font=(FONT_FAMILY, 11, "bold")).pack(side="left", padx=8)
 
         # ── Challenge counters ────────────────────────────────────
-        ch_frame = tk.Frame(parent, bg=BG3)
-        ch_frame.pack(fill="x", pady=4, ipady=6)
+        ch_frame = ctk.CTkFrame(parent, fg_color=BG3, corner_radius=12)
+        ch_frame.pack(fill="x", pady=5, ipady=6)
 
-        tk.Label(ch_frame, text="CHALLENGES REMAINING",
-                 fg=TEXT_DIM, bg=BG3,
-                 font=("Helvetica", 9, "bold")).grid(row=0, column=0, columnspan=4, sticky="w", padx=8, pady=(2,4))
+        ctk.CTkLabel(ch_frame, text="CHALLENGES REMAINING",
+                     text_color=TEXT_DIM, fg_color="transparent",
+                     font=(FONT_FAMILY, 10, "bold")).grid(row=0, column=0, columnspan=4,
+                                                           sticky="w", padx=12, pady=(6, 4))
 
         self._ch_a_var = tk.StringVar(value="●●")
         self._ch_b_var = tk.StringVar(value="●●")
 
-        tk.Label(ch_frame, textvariable=self._name_a_var,
-                 fg=SCORE_A_COL, bg=BG3, font=("Helvetica", 10)).grid(row=1, column=0, padx=8)
-        tk.Label(ch_frame, textvariable=self._ch_a_var,
-                 fg=GREEN, bg=BG3, font=("Helvetica", 16)).grid(row=1, column=1, padx=4)
-        tk.Label(ch_frame, textvariable=self._name_b_var,
-                 fg=SCORE_B_COL, bg=BG3, font=("Helvetica", 10)).grid(row=1, column=2, padx=8)
-        tk.Label(ch_frame, textvariable=self._ch_b_var,
-                 fg=GREEN, bg=BG3, font=("Helvetica", 16)).grid(row=1, column=3, padx=4)
+        ctk.CTkLabel(ch_frame, textvariable=self._name_a_var,
+                     text_color=SCORE_A_COL, fg_color="transparent",
+                     font=(FONT_FAMILY, 11)).grid(row=1, column=0, padx=8, pady=(0, 6))
+        ctk.CTkLabel(ch_frame, textvariable=self._ch_a_var,
+                     text_color=GREEN, fg_color="transparent",
+                     font=(FONT_FAMILY, 17)).grid(row=1, column=1, padx=4, pady=(0, 6))
+        ctk.CTkLabel(ch_frame, textvariable=self._name_b_var,
+                     text_color=SCORE_B_COL, fg_color="transparent",
+                     font=(FONT_FAMILY, 11)).grid(row=1, column=2, padx=8, pady=(0, 6))
+        ctk.CTkLabel(ch_frame, textvariable=self._ch_b_var,
+                     text_color=GREEN, fg_color="transparent",
+                     font=(FONT_FAMILY, 17)).grid(row=1, column=3, padx=4, pady=(0, 6))
 
         ch_frame.columnconfigure(0, weight=1)
         ch_frame.columnconfigure(1, weight=1)
@@ -290,79 +323,83 @@ class UmpireDashboard:
 
         # ── Decision flash ────────────────────────────────────────
         self._decision_var = tk.StringVar(value="")
-        self._decision_lbl = tk.Label(parent, textvariable=self._decision_var,
-                 font=("Helvetica", 28, "bold"),
-                 bg=BG, fg=GREEN, pady=6)
-        self._decision_lbl.pack(fill="x")
+        self._decision_lbl = ctk.CTkLabel(parent, textvariable=self._decision_var,
+                 font=(FONT_FAMILY, 26, "bold"),
+                 fg_color="transparent", text_color=GREEN)
+        self._decision_lbl.pack(fill="x", pady=4)
 
         # ── Control buttons ───────────────────────────────────────
         self._build_controls(parent)
 
     def _build_controls(self, parent):
-        tk.Label(parent, text="UMPIRE CONTROLS",
-                 fg=TEXT_DIM, bg=BG,
-                 font=("Helvetica", 9, "bold")).pack(anchor="w", pady=(8, 2))
+        ctk.CTkLabel(parent, text="UMPIRE CONTROLS",
+                     text_color=TEXT_DIM, fg_color="transparent",
+                     font=(FONT_FAMILY, 10, "bold")).pack(anchor="w", pady=(6, 4))
 
-        ctrl = tk.Frame(parent, bg=BG)
+        ctrl = ctk.CTkFrame(parent, fg_color="transparent")
         ctrl.pack(fill="x")
 
         # Point buttons
-        row1 = tk.Frame(ctrl, bg=BG);  row1.pack(fill="x", pady=2)
-        self._btn(row1, f"＋ Point A", lambda: self.add_point("A"),
-                  SCORE_A_COL, BG3).pack(side="left", expand=True, fill="x", padx=2)
-        self._btn(row1, f"＋ Point B", lambda: self.add_point("B"),
-                  SCORE_B_COL, BG3).pack(side="left", expand=True, fill="x", padx=2)
+        row1 = ctk.CTkFrame(ctrl, fg_color="transparent");  row1.pack(fill="x", pady=3)
+        self._btn(row1, "＋ Point A", lambda: self.add_point("A"),
+                  SCORE_A_COL).pack(side="left", expand=True, fill="x", padx=2)
+        self._btn(row1, "＋ Point B", lambda: self.add_point("B"),
+                  SCORE_B_COL).pack(side="left", expand=True, fill="x", padx=2)
 
         # Override last call
-        row2 = tk.Frame(ctrl, bg=BG);  row2.pack(fill="x", pady=2)
+        row2 = ctk.CTkFrame(ctrl, fg_color="transparent");  row2.pack(fill="x", pady=3)
         self._btn(row2, "✓ Override → IN", self._override_in,
-                  GREEN, BG3).pack(side="left", expand=True, fill="x", padx=2)
+                  GREEN).pack(side="left", expand=True, fill="x", padx=2)
         self._btn(row2, "✗ Override → OUT", self._override_out,
-                  RED, BG3).pack(side="left", expand=True, fill="x", padx=2)
+                  RED).pack(side="left", expand=True, fill="x", padx=2)
 
         # Challenge buttons
-        row3 = tk.Frame(ctrl, bg=BG);  row3.pack(fill="x", pady=2)
+        row3 = ctk.CTkFrame(ctrl, fg_color="transparent");  row3.pack(fill="x", pady=3)
         self._btn(row3, "🏳 Challenge A", lambda: self._challenge("A"),
-                  YELLOW, BG3).pack(side="left", expand=True, fill="x", padx=2)
+                  YELLOW).pack(side="left", expand=True, fill="x", padx=2)
         self._btn(row3, "🏳 Challenge B", lambda: self._challenge("B"),
-                  YELLOW, BG3).pack(side="left", expand=True, fill="x", padx=2)
+                  YELLOW).pack(side="left", expand=True, fill="x", padx=2)
 
         # Serve toggle / undo / reset
-        row4 = tk.Frame(ctrl, bg=BG);  row4.pack(fill="x", pady=2)
+        row4 = ctk.CTkFrame(ctrl, fg_color="transparent");  row4.pack(fill="x", pady=3)
         self._btn(row4, "🔄 Toggle Serve", self._toggle_serve,
-                  TEXT_DIM, BG3).pack(side="left", expand=True, fill="x", padx=2)
+                  TEXT_DIM).pack(side="left", expand=True, fill="x", padx=2)
         self._btn(row4, "↩ Undo Last Pt", self._undo_point,
-                  ORANGE, BG3).pack(side="left", expand=True, fill="x", padx=2)
+                  ORANGE).pack(side="left", expand=True, fill="x", padx=2)
 
-        row5 = tk.Frame(ctrl, bg=BG);  row5.pack(fill="x", pady=2)
+        row5 = ctk.CTkFrame(ctrl, fg_color="transparent");  row5.pack(fill="x", pady=3)
         self._btn(row5, "🔁 New Set", self._new_set,
-                  CYAN, BG3).pack(side="left", expand=True, fill="x", padx=2)
+                  CYAN).pack(side="left", expand=True, fill="x", padx=2)
         self._btn(row5, "🗑 Reset Match", self._reset_match,
-                  RED, BG3).pack(side="left", expand=True, fill="x", padx=2)
+                  RED).pack(side="left", expand=True, fill="x", padx=2)
 
-        row6 = tk.Frame(ctrl, bg=BG);  row6.pack(fill="x", pady=2)
+        row6 = ctk.CTkFrame(ctrl, fg_color="transparent");  row6.pack(fill="x", pady=3)
         self._btn(row6, "💾 Export Log", self._export_log,
-                  TEXT_DIM, BG3).pack(side="left", expand=True, fill="x", padx=2)
+                  TEXT_DIM).pack(side="left", expand=True, fill="x", padx=2)
 
     # ── Right panel: rally log ────────────────────────────────────
 
     def _build_right(self, parent):
-        tk.Label(parent, text="RALLY LOG",
-                 fg=TEXT_DIM, bg=BG,
-                 font=("Helvetica", 9, "bold")).pack(anchor="w", pady=(4, 2))
+        ctk.CTkLabel(parent, text="RALLY LOG",
+                     text_color=TEXT_DIM, fg_color="transparent",
+                     font=(FONT_FAMILY, 10, "bold")).pack(anchor="w", pady=(4, 4))
 
-        log_frame = tk.Frame(parent, bg=BG2, bd=1, relief="solid")
+        log_frame = ctk.CTkFrame(parent, fg_color=BG2, corner_radius=12,
+                                  border_width=1, border_color=BORDER)
         log_frame.pack(fill="both", expand=True)
 
-        scrollbar = tk.Scrollbar(log_frame, bg=BG3, troughcolor=BG2)
+        inner = tk.Frame(log_frame, bg=BG2)
+        inner.pack(fill="both", expand=True, padx=8, pady=8)
+
+        scrollbar = tk.Scrollbar(inner, bg=BG3, troughcolor=BG2)
         scrollbar.pack(side="right", fill="y")
 
         self._log_list = tk.Listbox(
-            log_frame,
+            inner,
             yscrollcommand=scrollbar.set,
             bg=BG2, fg=TEXT,
-            font=("Courier", 10),
-            selectbackground=BG3,
+            font=("Consolas", 10),
+            selectbackground=BG4,
             selectforeground=WHITE,
             bd=0,
             highlightthickness=0,
@@ -372,25 +409,25 @@ class UmpireDashboard:
         scrollbar.config(command=self._log_list.yview)
 
         # Summary row at bottom of right panel
-        sum_frame = tk.Frame(parent, bg=BG3)
-        sum_frame.pack(fill="x", pady=(4,0), ipady=4)
+        sum_frame = ctk.CTkFrame(parent, fg_color=BG3, corner_radius=10)
+        sum_frame.pack(fill="x", pady=(6, 0), ipady=6)
 
-        tk.Label(sum_frame, text="Session stats:",
-                 fg=TEXT_DIM, bg=BG3, font=("Helvetica", 9)).pack(side="left", padx=6)
+        ctk.CTkLabel(sum_frame, text="Session stats:",
+                     text_color=TEXT_DIM, fg_color="transparent",
+                     font=(FONT_FAMILY, 10)).pack(side="left", padx=10)
         self._stats_var = tk.StringVar(value="Rallies: 0  |  IN: 0  |  OUT: 0")
-        tk.Label(sum_frame, textvariable=self._stats_var,
-                 fg=TEXT, bg=BG3, font=("Courier", 9)).pack(side="left")
+        ctk.CTkLabel(sum_frame, textvariable=self._stats_var,
+                     text_color=TEXT, fg_color="transparent",
+                     font=("Consolas", 10)).pack(side="left")
 
     # ── Widget helper ─────────────────────────────────────────────
 
-    def _btn(self, parent, text, cmd, fg, bg):
-        return tk.Button(parent, text=text, command=cmd,
-                         fg=fg, bg=bg, bd=0,
-                         font=("Helvetica", 10, "bold"),
-                         padx=6, pady=5,
-                         activebackground=BORDER,
-                         activeforeground=WHITE,
-                         cursor="hand2")
+    def _btn(self, parent, text, cmd, accent):
+        return ctk.CTkButton(parent, text=text, command=cmd,
+                              text_color=accent, fg_color=BG3, hover_color=BG4,
+                              corner_radius=8,
+                              font=(FONT_FAMILY, 11, "bold"),
+                              height=36)
 
     # ═══════════════════════════════════════════════════════════════
     #  Queue polling (runs on Tkinter thread via after())
@@ -443,7 +480,7 @@ class UmpireDashboard:
         # Log entry
         rally_num = len(self.rally_log) + 1
         ts        = datetime.datetime.now().strftime("%H:%M:%S")
-        cm_str    = f"({cm[0]:.0f},{cm[1]:.0f})cm" if cm else ""
+        cm_str    = f"{cm[0]:+.0f}px" if cm else ""
         dec_str   = decision if decision else "manual"
         entry = {
             "num"     : rally_num,
@@ -614,25 +651,26 @@ class UmpireDashboard:
     # ── Name editor ───────────────────────────────────────────────
 
     def _edit_names(self):
-        win = tk.Toplevel(self._root)
+        win = ctk.CTkToplevel(self._root)
         win.title("Edit Names")
-        win.configure(bg=BG)
-        win.geometry("360x160")
+        win.configure(fg_color=BG)
+        win.geometry("360x200")
         win.resizable(False, False)
+        win.transient(self._root)
 
-        tk.Label(win, text="Player A name:", fg=TEXT, bg=BG,
-                 font=("Helvetica", 11)).grid(row=0, column=0, padx=12, pady=8, sticky="w")
-        ea = tk.Entry(win, font=("Helvetica", 11), bg=BG3, fg=WHITE,
-                      insertbackground=WHITE, bd=1)
+        ctk.CTkLabel(win, text="Player A name:", text_color=TEXT, fg_color="transparent",
+                     font=(FONT_FAMILY, 12)).grid(row=0, column=0, padx=14, pady=12, sticky="w")
+        ea = ctk.CTkEntry(win, font=(FONT_FAMILY, 12), fg_color=BG3, text_color=WHITE,
+                           width=170, corner_radius=8)
         ea.insert(0, self.name_a)
-        ea.grid(row=0, column=1, padx=8, pady=8)
+        ea.grid(row=0, column=1, padx=10, pady=12)
 
-        tk.Label(win, text="Player B name:", fg=TEXT, bg=BG,
-                 font=("Helvetica", 11)).grid(row=1, column=0, padx=12, pady=4, sticky="w")
-        eb = tk.Entry(win, font=("Helvetica", 11), bg=BG3, fg=WHITE,
-                      insertbackground=WHITE, bd=1)
+        ctk.CTkLabel(win, text="Player B name:", text_color=TEXT, fg_color="transparent",
+                     font=(FONT_FAMILY, 12)).grid(row=1, column=0, padx=14, pady=6, sticky="w")
+        eb = ctk.CTkEntry(win, font=(FONT_FAMILY, 12), fg_color=BG3, text_color=WHITE,
+                           width=170, corner_radius=8)
         eb.insert(0, self.name_b)
-        eb.grid(row=1, column=1, padx=8, pady=4)
+        eb.grid(row=1, column=1, padx=10, pady=6)
 
         def _apply():
             self.name_a = ea.get().strip() or "Player A"
@@ -642,10 +680,10 @@ class UmpireDashboard:
             self._refresh_ui()
             win.destroy()
 
-        tk.Button(win, text="Save", command=_apply,
-                  fg=WHITE, bg=CYAN, bd=0, padx=12, pady=4,
-                  font=("Helvetica", 11, "bold")).grid(
-                  row=2, column=0, columnspan=2, pady=10)
+        ctk.CTkButton(win, text="Save", command=_apply,
+                      text_color=WHITE, fg_color=CYAN, hover_color="#3d8bd6",
+                      corner_radius=8, font=(FONT_FAMILY, 12, "bold")).grid(
+                      row=2, column=0, columnspan=2, pady=16)
 
     # ── Export ────────────────────────────────────────────────────
 
@@ -660,6 +698,7 @@ class UmpireDashboard:
         lines = [
             "ShuttleEye — Umpire Rally Log",
             f"Date: {datetime.date.today()}",
+            f"Umpire: {self.umpire_name} ({self.role})",
             f"Players: {self.name_a} vs {self.name_b}",
             f"Sets won: A={self.sets_a}  B={self.sets_b}",
             "=" * 60,
@@ -698,10 +737,10 @@ class UmpireDashboard:
             self._status_var.set("")
 
         # Score label flash colour
-        self._score_a_label.config(
-            fg=WHITE if self.serve=="A" else SCORE_A_COL)
-        self._score_b_label.config(
-            fg=WHITE if self.serve=="B" else SCORE_B_COL)
+        self._score_a_label.configure(
+            text_color=WHITE if self.serve=="A" else SCORE_A_COL)
+        self._score_b_label.configure(
+            text_color=WHITE if self.serve=="B" else SCORE_B_COL)
 
         # Serve
         sn = self.name_a if self.serve=="A" else self.name_b
@@ -753,7 +792,7 @@ class UmpireDashboard:
 
     def _flash_decision(self, text, color):
         self._decision_var.set(text)
-        self._decision_lbl.config(fg=color)
+        self._decision_lbl.configure(text_color=color)
         # Clear after 2.5 s
         self._root.after(2500, lambda: self._decision_var.set(""))
 

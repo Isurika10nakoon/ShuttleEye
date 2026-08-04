@@ -12,16 +12,26 @@
 import cv2
 import time
 import os
+import sys
 
 from shuttle_detection  import ShuttleDetector
 from landing_detection  import LandingDetector
 from line_judge         import LineJudge
 from umpire_dashboard   import UmpireDashboard
+from login_window       import run_login_flow
 import calibration
 
 # ── Config ───────────────────────────────────────────────────────
 VIDEO_SOURCE = "videos/test1.mp4"  # 0 for webcam
 # ─────────────────────────────────────────────────────────────────
+
+# ── Login (blocks in main thread until a valid session is chosen) ─
+session = run_login_flow()
+if session is None:
+    print("[ShuttleEye] Login cancelled. Exiting.")
+    sys.exit(0)
+umpire_name, role = session
+print(f"[ShuttleEye] Logged in as '{umpire_name}' ({role})")
 
 cap = cv2.VideoCapture(VIDEO_SOURCE)
 cap.set(cv2.CAP_PROP_FRAME_WIDTH,  1280)
@@ -34,7 +44,7 @@ if not calibration.load_court_points():
     calibration.calibrate(cap)   # tries auto → falls back to manual
 
 # ── Umpire dashboard ──────────────────────────────────────────────
-dashboard = UmpireDashboard()
+dashboard = UmpireDashboard(umpire_name=umpire_name, role=role)
 dashboard.start()   # runs in background thread; non-blocking
 
 # ── Core components ───────────────────────────────────────────────
@@ -152,10 +162,11 @@ while True:
                 (20, 116), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255,220,80), 2)
 
     if shuttle_pos:
-        cm_pos = calibration.pixel_to_real(*shuttle_pos)
-        if cm_pos:
+        offs = calibration.line_offsets(*shuttle_pos)
+        if offs:
+            dist = offs[0]
             cv2.putText(frame,
-                        f"Shuttle: px{shuttle_pos} ({cm_pos[0]:.0f},{cm_pos[1]:.0f})cm",
+                        f"Shuttle: px{shuttle_pos}  {dist:+.0f}px from line",
                         (20, 148), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0,255,255), 2)
 
     if show_debug:
