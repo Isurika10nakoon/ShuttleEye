@@ -4,6 +4,7 @@
 #  ───────────────────
 #  Q   quit
 #  C   re-run automatic calibration
+#  M   manual calibration (click lines by hand)
 #  P   pause / resume
 #  D   toggle debug HUD
 #  F   toggle fullscreen
@@ -82,7 +83,7 @@ WINDOW_NAME = "ShuttleEye"
 cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
 
 print("\n[ShuttleEye] Running")
-print("  Q=quit  C=calibrate  P=pause  D=debug  F=fullscreen  S=stats\n")
+print("  Q=quit  C=calibrate  M=manual-calibrate  P=pause  D=debug  F=fullscreen  S=stats\n")
 
 
 def _draw_debug(frame, lander):
@@ -143,6 +144,11 @@ while True:
         if os.path.exists(calibration.CONFIG_FILE):
             os.remove(calibration.CONFIG_FILE)
         calibration.calibrate(cap)
+
+    elif key == ord('m'):
+        # On-demand manual calibration -- click lines by hand when
+        # automatic detection isn't reliable for this footage.
+        calibration.calibrate_manual(cap)
 
     if paused:
         continue

@@ -44,13 +44,21 @@
 #      two it's a court-corner wedge; with all 4 outer lines it's exactly
 #      "inside the court rectangle."
 #
-#   6. Manual line placement is not used — it's too easy to place a line
-#      slightly wrong and never notice. If the fast pass (sharpest frames
-#      only) finds nothing, it retries with a wider automatic search
-#      (every loaded frame, lower Hough sensitivities) before giving up.
-#      If that still finds nothing, the system simply runs uncalibrated
-#      until a later automatic attempt succeeds (e.g. lighting improves,
-#      or the camera framing changes) — pressing C re-triggers detection.
+#   6. calibrate() — the normal entry point — is automatic-only. If the
+#      fast pass (sharpest frames only) finds nothing, it retries with a
+#      wider automatic search (every loaded frame, lower Hough
+#      sensitivities) before giving up. If that still finds nothing, the
+#      system simply runs uncalibrated until a later automatic attempt
+#      succeeds (e.g. lighting improves) — pressing C re-triggers it.
+#
+#      calibrate_manual() is a SEPARATE, on-demand entry point — a click
+#      UI for placing (or correcting) lines by hand, for footage where
+#      automatic detection isn't reliable (a shared multi-court floor,
+#      heavy glare). It's never opened by the system on its own, only
+#      when explicitly invoked (e.g. a keybinding in the app). Even a
+#      manually-placed line still gets its IN side worked out from colour
+#      automatically, and its centre/thickness sharpened the same way an
+#      auto-detected line's is.
 # ═══════════════════════════════════════════════════════════════════════
 
 import cv2
@@ -92,9 +100,9 @@ SAMPLE_PATCH     = 9   # odd side length of each colour-sample patch
 TEXTURE_WINDOW    = 21     # odd side length of the texture-sample window
 MAX_SIDE_TEXTURE  = 150.0  # Laplacian variance
 
-# White court line: low colour saturation, high brightness.
+# White court line: low colour saturation. (Brightness is judged locally,
+# not by a fixed floor here — see _white_line_mask.)
 WHITE_S_MAX = 60
-WHITE_V_MIN = 170
 
 # ── Module state ────────────────────────────────────────────────────────
 # List of calibrated lines, each a dict:
@@ -112,19 +120,28 @@ def _white_line_mask(frame):
     Isolate painted white boundary lines using two complementary cues
     combined with AND, so each cancels the other's false positives:
 
-      1. Colour   — the line is white: low saturation, high brightness.
-                     Alone, this would also match white shirts/shoes, sky,
-                     or bright ad boards.
+      1. Colour   — the line is white: low saturation. Alone, this would
+                     also match white shirts/shoes, sky, or bright ad
+                     boards.
       2. Contrast — a top-hat transform keeps only features that are
-                     narrow and brighter than their immediate surroundings.
-                     Alone, this would also match skin, reflections, or any
-                     other locally-bright edge regardless of colour.
+                     narrow and LOCALLY brighter than their immediate
+                     surroundings. Alone, this would also match skin,
+                     reflections, or any other locally-bright edge
+                     regardless of colour.
 
-    A pixel that is both "white" and "a thin bright feature" is, on a
-    badminton court, a boundary line.
+    Brightness is deliberately judged locally (via the top-hat), not
+    against a fixed floor: a real painted line can be near-white (V~255)
+    right under the camera and much dimmer (V~85) in a shadowed or
+    distant stretch of the same physical line — a fixed absolute
+    brightness floor would cut that dim stretch off entirely, even though
+    it's still clearly brighter than ITS surroundings, which is what
+    actually makes it a line.
+
+    A pixel that is both low-saturation and a locally-bright thin feature
+    is, on a badminton court, a boundary line.
     """
-    hsv         = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-    white_color = cv2.inRange(hsv, (0, 0, WHITE_V_MIN), (180, WHITE_S_MAX, 255))
+    hsv     = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    low_sat = cv2.inRange(hsv[:, :, 1], 0, WHITE_S_MAX)
 
     gray    = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     blur    = cv2.GaussianBlur(gray, (5, 5), 0)
@@ -132,7 +149,7 @@ def _white_line_mask(frame):
     tophat  = cv2.morphologyEx(blur, cv2.MORPH_TOPHAT, kernel)
     _, contrast_mask = cv2.threshold(tophat, 25, 255, cv2.THRESH_BINARY)
 
-    return cv2.bitwise_and(white_color, contrast_mask)
+    return cv2.bitwise_and(low_sat, contrast_mask)
 
 
 def _sharpness(frame):
@@ -460,7 +477,42 @@ def _dedupe_lines(candidates, pos_tol=20):
     return [g['best'] for g in groups]
 
 
-def _select_boundary_lines(candidates, frame_shape):
+def _motion_center_x(frames, max_frames=150, warmup=30):
+    """
+    Rough horizontal centre of player activity — used to anchor which pair
+    of sidelines belongs to the court actually in play, on a shared
+    multi-court floor where several courts' sidelines can all be visible
+    at once. Returns None if no real motion is found (e.g. an empty
+    court), so callers can fall back to frame geometry.
+
+    MOG2 needs a run of CONSECUTIVE frames to build a stable background
+    model — feeding it a sparse/decimated sample starves it of that and
+    its foreground output is unreliable noise, not real motion. This
+    processes frames in original order and only trusts the output after
+    a warm-up period, the same way the shuttle detector's own background
+    subtractor is used elsewhere in this codebase.
+    """
+    n = min(max_frames, len(frames))
+    backSub = cv2.createBackgroundSubtractorMOG2(
+        history=max(warmup, 1), varThreshold=40, detectShadows=False)
+
+    xs, weights = [], []
+    for i in range(n):
+        fg = backSub.apply(frames[i])
+        if i < warmup:
+            continue   # let the model converge before trusting its output
+        _, fg = cv2.threshold(fg, 200, 255, cv2.THRESH_BINARY)
+        xs_idx = np.nonzero(fg)[1]
+        if len(xs_idx) > 50:   # ignore near-empty/noise frames
+            xs.append(float(np.mean(xs_idx)))
+            weights.append(len(xs_idx))
+
+    if not xs:
+        return None
+    return float(np.average(xs, weights=weights))
+
+
+def _select_boundary_lines(candidates, frame_shape, motion_center_x=None):
     """
     Keeps only the boundary of THIS court per orientation.
 
@@ -472,13 +524,20 @@ def _select_boundary_lines(candidates, frame_shape):
     out side by side reusing the same lines/space). Those extra lines
     aren't internal markings of one court, they can be another court's
     sideline entirely — taking the outermost pair in that case would span
-    multiple courts' width, not just this one's. Instead, bracket the
-    frame centre: keep the nearest line on each side of the frame's
-    midline, since a dedicated court camera is framed on the court
-    actually in play, which should sit roughly centred in the shot.
+    multiple courts' width, not just this one's. Instead, bracket a
+    centre point with the nearest line on each side of it.
+
+    For the sidelines ('V'), that centre point is the horizontal centre
+    of where players are actually seen moving (motion_center_x), when
+    available — a much more direct anchor for "this court" than frame
+    geometry, since it's literally where the game is being played. Falls
+    back to the frame's own centre otherwise (e.g. an empty court, or 'H').
     """
     h, w = frame_shape[:2]
-    center = {'H': h / 2.0, 'V': w / 2.0}
+    center = {
+        'H': h / 2.0,
+        'V': motion_center_x if motion_center_x is not None else w / 2.0,
+    }
 
     result = []
     for o in ('H', 'V'):
@@ -539,13 +598,148 @@ def auto_calibrate(frames, exhaustive=False):
         print("[AutoCalib] No boundary line found across attempts.")
         return []
 
+    motion_center_x = _motion_center_x(frames)
+    if motion_center_x is not None:
+        print(f"[AutoCalib] Player motion centre x={motion_center_x:.0f}")
+    else:
+        print("[AutoCalib] No player motion detected — using frame centre")
+
     deduped = _dedupe_lines(all_candidates)
-    lines   = _select_boundary_lines(deduped, frames[0].shape)
+    lines   = _select_boundary_lines(deduped, frames[0].shape, motion_center_x)
 
     for l in lines:
         print(f"[AutoCalib] {l['orientation']} boundary line "
               f"length={l['length']:.0f}px endpoints={l['endpoints']}")
     return lines
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  Manual calibration (on-demand — not a fallback the system opens on its
+#  own; only used when the app explicitly asks for it, e.g. a keybinding)
+# ═══════════════════════════════════════════════════════════════════════
+
+def _manual_line_ui(frame):
+    """
+    Click up to 2 lines (2 points each). ENTER confirms after the 2nd or
+    4th point placed — so a single visible line still works, but a corner
+    view can capture both. The IN side of each clicked line is still
+    worked out automatically from colour, never asked for.
+    """
+    pts = []
+    win = "Calibration (click 2 points per line — up to 2 lines)"
+    cv2.namedWindow(win, cv2.WINDOW_NORMAL)
+    cv2.resizeWindow(win, 1280, 760)
+
+    def on_mouse(event, x, y, flags, param):
+        if event == cv2.EVENT_LBUTTONDOWN and len(pts) < 4:
+            pts.append((x, y))
+
+    cv2.setMouseCallback(win, on_mouse)
+
+    confirmed = False
+    while True:
+        disp = frame.copy()
+        for p in pts:
+            cv2.circle(disp, p, 6, (0, 255, 255), -1)
+        if len(pts) >= 2:
+            cv2.line(disp, pts[0], pts[1], (0, 255, 255), 2)
+        if len(pts) == 4:
+            cv2.line(disp, pts[2], pts[3], (0, 200, 255), 2)
+        cv2.putText(disp,
+                    "Click 2 pts/line (up to 2 lines).  ENTER=confirm  R=reset  ESC=cancel",
+                    (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2)
+        cv2.imshow(win, disp)
+        key = cv2.waitKey(16) & 0xFF
+
+        if key == 13 and len(pts) in (2, 4):
+            confirmed = True
+            break
+        elif key == 27:
+            break
+        elif key == ord('r'):
+            pts = []
+
+    cv2.destroyWindow(win)
+    if not confirmed:
+        return []
+
+    mask  = _white_line_mask(frame)
+    lines = []
+    for i in range(0, len(pts), 2):
+        point = np.array(pts[i], dtype=np.float64)
+        end   = np.array(pts[i+1], dtype=np.float64)
+        direction = end - point
+        length    = float(np.linalg.norm(direction))
+        if length < 1:
+            continue
+        direction /= length
+        endpoints = (pts[i], pts[i+1])
+        t_min, t_max = 0.0, length
+
+        # Snap the clicked line onto the true painted-line centre, same as
+        # the auto path, so a manually-placed line is just as sharp.
+        refined = _refine_centerline(mask, point, direction, t_min, t_max)
+        if refined is not None:
+            point, direction, t_min, t_max, thickness = refined
+            margin = min(MAX_MARGIN_PX, max(MIN_MARGIN_PX, thickness / 2.0))
+            p1 = point + direction*t_min
+            p2 = point + direction*t_max
+            endpoints = (tuple(int(v) for v in p1), tuple(int(v) for v in p2))
+            length = t_max - t_min
+        else:
+            margin = DEFAULT_MARGIN_PX
+
+        in_normal = _determine_in_side(frame, mask, point, direction, t_min, t_max)
+        if in_normal is None:
+            in_normal = np.array([-direction[1], direction[0]])
+            print("[Calibration] WARNING: could not auto-detect the IN side by "
+                  "colour for a manually-placed line — defaulted; verify the "
+                  "IN/OUT overlay looks correct.")
+
+        lines.append({
+            'point': point, 'direction': direction, 'normal': in_normal,
+            'endpoints': endpoints, 'length': length, 'margin': margin,
+            'orientation': _orientation(direction),
+        })
+    return lines
+
+
+def calibrate_manual(cap):
+    """
+    On-demand manual calibration: opens the click UI directly, regardless
+    of whether automatic detection would succeed. Unlike calibrate(), this
+    is never invoked by the system on its own — only when the caller
+    explicitly wants to place or correct lines by hand (e.g. a keybinding
+    in the app), for footage where automatic detection isn't reliable
+    (a shared multi-court floor, heavy glare, etc.).
+    """
+    print("\n[Calibration] ── Manual (on-demand) ─────────────────────")
+    print("  Loading a frame …")
+
+    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+    frames = []
+    while len(frames) < 60:
+        ret, f = cap.read()
+        if not ret:
+            break
+        frames.append(f)
+    if not frames:
+        raise RuntimeError("No frames available for calibration.")
+
+    best_idx = int(np.argmax([_sharpness(f) for f in frames]))
+    lines = _manual_line_ui(frames[best_idx])
+
+    ok = bool(lines)
+    if ok:
+        _apply(lines)
+        _save()
+        print(f"[Calibration] Manual line(s) saved "
+              f"({len(lines)} line(s): {[l['orientation'] for l in lines]})\n")
+    else:
+        print("[Calibration] Cancelled.\n")
+
+    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+    return ok
 
 
 # ═══════════════════════════════════════════════════════════════════════
