@@ -3,7 +3,7 @@
 #  KEYBOARD  (CV window)
 #  ───────────────────
 #  Q   quit
-#  C   re-calibrate  (manual override)
+#  C   re-run automatic calibration
 #  P   pause / resume
 #  D   toggle debug HUD
 #  F   toggle fullscreen
@@ -20,11 +20,20 @@ from landing_detection  import LandingDetector
 from line_judge         import LineJudge
 from umpire_dashboard   import UmpireDashboard
 from login_window       import run_login_flow
+from web_dashboard      import run_web_dashboard  
 import calibration
+import auth
+import db
 
 # ── Config ───────────────────────────────────────────────────────
-VIDEO_SOURCE = "videos/test1.mp4"  # 0 for webcam
+VIDEO_SOURCE = "videos/test4.mp4"  # 0 for webcam
+COURT_NAME   = os.environ.get("COURT_NAME", "Court 1")  # shown to the
+                                                          # admin's multi-court view
 # ─────────────────────────────────────────────────────────────────
+
+# ── Database (creates tables + seeds default accounts on first run) ─
+db.init_db()
+auth.ensure_default_accounts()
 
 # ── Login (blocks in main thread until a valid session is chosen) ─
 session = run_login_flow()
@@ -32,7 +41,7 @@ if session is None:
     print("[ShuttleEye] Login cancelled. Exiting.")
     sys.exit(0)
 umpire_name, role = session
-print(f"[ShuttleEye] Logged in as '{umpire_name}' ({role})")
+print(f"[ShuttleEye] Logged in as '{umpire_name}' ({role}) — {COURT_NAME}")
 
 cap = cv2.VideoCapture(VIDEO_SOURCE)
 cap.set(cv2.CAP_PROP_FRAME_WIDTH,  1280)
@@ -40,13 +49,19 @@ cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
 if not cap.isOpened():
     raise RuntimeError(f"Cannot open: {VIDEO_SOURCE}")
 
-# ── Calibration: auto-first, manual fallback ──────────────────────
+# ── Calibration: fully automatic, no manual line placement ────────
 if not calibration.load_court_points():
-    calibration.calibrate(cap)   # tries auto → falls back to manual
+    calibration.calibrate(cap)
 
 # ── Umpire dashboard ──────────────────────────────────────────────
-dashboard = UmpireDashboard(umpire_name=umpire_name, role=role)
+dashboard = UmpireDashboard(umpire_name=umpire_name, role=role, court_name=COURT_NAME)
 dashboard.start()   # runs in background thread; non-blocking
+
+# ── Remote dashboard — lets the umpire's own phone/tablet/laptop view
+#    and control the match over the network, separate from this PC ─────
+web_url = run_web_dashboard(dashboard)
+print(f"[ShuttleEye] Remote umpire dashboard: {web_url}")
+print( "[ShuttleEye] Open that address on the umpire's device (same Wi-Fi/network) to log in.")
 
 # ── Core components ───────────────────────────────────────────────
 def _on_decision(decision, cm, px):
@@ -124,7 +139,7 @@ while True:
         print(f"[Stats] Score {a}–{b}  | Decisions: {total} total, {ins} IN, {outs} OUT")
 
     elif key == ord('c'):
-        # Force re-calibration (manual)
+        # Force a fresh automatic recalibration
         if os.path.exists(calibration.CONFIG_FILE):
             os.remove(calibration.CONFIG_FILE)
         calibration.calibrate(cap)

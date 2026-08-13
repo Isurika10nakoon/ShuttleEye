@@ -1,3 +1,6 @@
 opencv-python
 numpy
 customtkinter
+flask
+psycopg[binary]
+python-dotenv

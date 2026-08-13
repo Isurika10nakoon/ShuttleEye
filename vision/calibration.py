@@ -15,30 +15,42 @@
 #      lines, and buckets them as roughly-horizontal ('H') or
 #      roughly-vertical ('V') in the frame.
 #
-#      For each orientation there may be several parallel lines in a
-#      full-court view (e.g. near baseline, service lines, net, far
+#   2. Rejects any candidate whose surroundings aren't a real floor —
+#      a genuine boundary line separates two FLAT surfaces (court paint
+#      vs. floor/outside). The net's white top tape sits directly above
+#      the mesh webbing, which has fine grid texture no matter its exact
+#      colour, so it measures as high local edge-energy and gets rejected
+#      here — this is what keeps the net out even though it's just as
+#      white and line-shaped as a real floor line, and even if perspective
+#      would otherwise make it look like an outer boundary line (see 3).
+#
+#   3. For each orientation there may be several remaining parallel lines
+#      in a full-court view (e.g. near baseline, service lines, far
 #      baseline are all 'H'). Only the two most extreme — the outermost
 #      pair — are kept as the court boundary; everything in between is an
 #      internal line and is dropped. A corner view with just one line per
 #      orientation keeps that single line, unchanged from before.
 #
-#   2. Works out which side of EACH kept line is IN and which is OUT —
+#   4. Works out which side of EACH kept line is IN and which is OUT —
 #      this flips depending on where the camera happens to be fixed, so
 #      it can't be hardcoded. The court surface normally fills most of
 #      the shot, so whichever side's sampled surface colour is closer to
 #      the frame's own dominant colour is taken to be IN; the
 #      minority-colour side is OUT.
 #
-#   3. Combines all kept lines for the final verdict: a point is IN only
+#   5. Combines all kept lines for the final verdict: a point is IN only
 #      if it is on the IN side of every one of them (crossing any single
 #      boundary puts it OUT). With one line that's a half-plane test; with
 #      two it's a court-corner wedge; with all 4 outer lines it's exactly
 #      "inside the court rectangle."
 #
-#   4. Only if no line can be found at all (e.g. it's simply not visible
-#      in this footage) does it fall back to a minimal manual UI — click
-#      2 points per line. Even then, which side is IN is still worked out
-#      automatically from colour, not asked for.
+#   6. Manual line placement is not used — it's too easy to place a line
+#      slightly wrong and never notice. If the fast pass (sharpest frames
+#      only) finds nothing, it retries with a wider automatic search
+#      (every loaded frame, lower Hough sensitivities) before giving up.
+#      If that still finds nothing, the system simply runs uncalibrated
+#      until a later automatic attempt succeeds (e.g. lighting improves,
+#      or the camera framing changes) — pressing C re-triggers detection.
 # ═══════════════════════════════════════════════════════════════════════
 
 import cv2
@@ -66,6 +78,19 @@ MIN_LINE_LEN_FRAC = 0.15
 # How far off a line (perpendicular, in px) to sample surface colour.
 SAMPLE_OFFSET_PX = 25
 SAMPLE_PATCH     = 9   # odd side length of each colour-sample patch
+
+# A genuine court boundary separates two flat, unmarked surfaces (court
+# paint vs. floor/court paint vs. outside). If either side of a candidate
+# line has fine texture — many small edges, like a grid — it isn't really
+# bordering a flat surface. This is what specifically excludes the net:
+# the white top tape sits directly above the mesh webbing, whose grid
+# pattern reads as high local edge-energy no matter its exact colour.
+# Same test also screens out lines bordering spectators/foliage/signage.
+# Measured the same way frame sharpness already is elsewhere in this file
+# (Laplacian variance) but over a wider window, since a texture pattern
+# needs more area to show up in than a single colour-sample patch does.
+TEXTURE_WINDOW    = 21     # odd side length of the texture-sample window
+MAX_SIDE_TEXTURE  = 150.0  # Laplacian variance
 
 # White court line: low colour saturation, high brightness.
 WHITE_S_MAX = 60
@@ -262,10 +287,19 @@ def _dominant_frame_color(frame, exclude_mask):
     return np.median(lab[valid].reshape(-1, 3), axis=0)
 
 
-def _sample_side_color(lab, line_mask, point, direction, normal, sign, t_values, offset):
-    half = SAMPLE_PATCH // 2
+def _sample_side_color(lab, gray, line_mask, point, direction, normal, sign, t_values, offset):
+    """
+    Returns (median_color, texture) for the sampled side, or (None, None)
+    if no valid sample points were found. `texture` is the mean Laplacian
+    variance across a wider window at each sample point — near-zero for a
+    flat painted surface, high for something with fine structure like net
+    mesh (same edge-energy measure used for frame sharpness elsewhere in
+    this file, just applied locally instead of to the whole frame).
+    """
+    half      = SAMPLE_PATCH // 2
+    tex_half  = TEXTURE_WINDOW // 2
     h, w = line_mask.shape[:2]
-    samples = []
+    all_px, tex_scores = [], []
     for t in t_values:
         base = point + direction*t + normal*sign*offset
         cx, cy = int(base[0]), int(base[1])
@@ -276,25 +310,49 @@ def _sample_side_color(lab, line_mask, point, direction, normal, sign, t_values,
         px = patch[mask_patch == 0]
         if len(px) == 0:
             continue
-        samples.append(np.median(px.reshape(-1, 3), axis=0))
-    if not samples:
-        return None
-    return np.median(np.array(samples), axis=0)
+        all_px.append(px.reshape(-1, 3))
+
+        if cx-tex_half >= 0 and cy-tex_half >= 0 and cx+tex_half < w and cy+tex_half < h:
+            tex_patch = gray[cy-tex_half:cy+tex_half+1, cx-tex_half:cx+tex_half+1]
+            tex_scores.append(cv2.Laplacian(tex_patch, cv2.CV_64F).var())
+    if not all_px:
+        return None, None
+    all_px  = np.concatenate(all_px, axis=0)
+    median  = np.median(all_px, axis=0)
+    # Median, not mean: a sample point near a line intersection (e.g. a
+    # court corner, where a perpendicular line crosses through the texture
+    # window) is a legitimate single-sample outlier, not evidence the
+    # whole side is textured. Median ignores one or two such outliers but
+    # still flags a side where MOST samples show real texture (mesh).
+    texture = float(np.median(tex_scores)) if tex_scores else 0.0
+    return median, texture
 
 
 def _determine_in_side(frame, line_mask, point, direction, t_min, t_max):
     """
     Returns the unit normal vector pointing toward the IN side, or None
-    if it couldn't be determined (e.g. sample points fall outside frame).
+    if it couldn't be determined — either sample points fell outside the
+    frame, or one side is too visually non-uniform to be a real court-
+    adjacent surface (e.g. the net's mesh, spectators, foliage), in which
+    case this candidate line is rejected outright rather than risked as a
+    boundary.
     """
     normal   = np.array([-direction[1], direction[0]])
     t_values = np.linspace(t_min, t_max, 9)[1:-1]   # skip noisy extreme ends
     lab      = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB)
+    gray     = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
-    color_pos = _sample_side_color(lab, line_mask, point, direction, normal, +1, t_values, SAMPLE_OFFSET_PX)
-    color_neg = _sample_side_color(lab, line_mask, point, direction, normal, -1, t_values, SAMPLE_OFFSET_PX)
+    color_pos, tex_pos = _sample_side_color(lab, gray, line_mask, point, direction, normal, +1, t_values, SAMPLE_OFFSET_PX)
+    color_neg, tex_neg = _sample_side_color(lab, gray, line_mask, point, direction, normal, -1, t_values, SAMPLE_OFFSET_PX)
     dominant  = _dominant_frame_color(frame, line_mask)
     if color_pos is None or color_neg is None or dominant is None:
+        return None
+
+    if tex_pos > MAX_SIDE_TEXTURE or tex_neg > MAX_SIDE_TEXTURE:
+        print(f"[Calibration] Rejected a candidate line: one side has fine "
+              f"texture, not a flat court surface (texture={tex_pos:.0f}/{tex_neg:.0f}, "
+              f"limit={MAX_SIDE_TEXTURE}) — likely the net's mesh or background "
+              f"clutter, not a floor boundary line.")
         return None
 
     d_pos = np.linalg.norm(color_pos - dominant)
@@ -334,6 +392,7 @@ def _fit_candidates(frame, hough_threshold):
         if c['length'] < diag * MIN_LINE_LEN_FRAC:
             continue
         point, direction, t_min, t_max, endpoints = _fit_line(c['segs'])
+        length = c['length']
 
         # Sharpen the fit onto the true painted-line centre + measure its
         # real thickness, so the IN/OUT edge sits exactly on the line.
@@ -344,6 +403,11 @@ def _fit_candidates(frame, hough_threshold):
             p1 = point + direction*t_min
             p2 = point + direction*t_max
             endpoints = (tuple(int(v) for v in p1), tuple(int(v) for v in p2))
+            # The refined extent (validated cross-section by cross-section)
+            # is the real length — not the raw Hough cluster's segment sum,
+            # which can overstate it. Using the stale value here corrupted
+            # length-based comparisons downstream (dedup, boundary select).
+            length = t_max - t_min
         else:
             margin = DEFAULT_MARGIN_PX
 
@@ -352,7 +416,7 @@ def _fit_candidates(frame, hough_threshold):
             continue
         candidates.append({
             'point': point, 'direction': direction, 'normal': in_normal,
-            'endpoints': endpoints, 'length': c['length'], 'margin': margin,
+            'endpoints': endpoints, 'length': length, 'margin': margin,
             'orientation': _orientation(direction),
         })
     return candidates
@@ -396,50 +460,79 @@ def _dedupe_lines(candidates, pos_tol=20):
     return [g['best'] for g in groups]
 
 
-def _select_boundary_lines(candidates):
+def _select_boundary_lines(candidates, frame_shape):
     """
-    Keeps only the OUTER court boundary per orientation.
+    Keeps only the boundary of THIS court per orientation.
 
-    A corner-only camera view sees just one line per orientation — that
-    single line is the boundary, kept as-is. A camera placed behind the
-    court seeing the WHOLE court sees several parallel lines per
-    orientation (e.g. near baseline + far baseline, or short/long service
-    lines in between) — only the two most extreme (outermost) count as
-    the boundary; everything between them (service lines, centre line,
-    net) is an internal court line, not the edge of play, and is dropped.
+    With 1 line it's the boundary as-is (corner/single-line view). With 2,
+    they're the outer pair (e.g. near/far baseline) — kept as-is.
+
+    With 3+ parallel lines, this is very likely a facility with several
+    courts SHARING one floor (common for badminton halls — courts laid
+    out side by side reusing the same lines/space). Those extra lines
+    aren't internal markings of one court, they can be another court's
+    sideline entirely — taking the outermost pair in that case would span
+    multiple courts' width, not just this one's. Instead, bracket the
+    frame centre: keep the nearest line on each side of the frame's
+    midline, since a dedicated court camera is framed on the court
+    actually in play, which should sit roughly centred in the shot.
     """
+    h, w = frame_shape[:2]
+    center = {'H': h / 2.0, 'V': w / 2.0}
+
     result = []
     for o in ('H', 'V'):
         group = [c for c in candidates if c['orientation'] == o]
         if not group:
             continue
         group.sort(key=_line_position)
-        result.append(group[0])
-        if len(group) > 1:
-            result.append(group[-1])
+
+        if len(group) <= 2:
+            result.append(group[0])
+            if len(group) > 1:
+                result.append(group[-1])
+            continue
+
+        c0    = center[o]
+        left  = [g for g in group if _line_position(g) <= c0]
+        right = [g for g in group if _line_position(g) >  c0]
+        if left:
+            result.append(max(left, key=_line_position))    # nearest to centre, left/above
+        if right:
+            result.append(min(right, key=_line_position))   # nearest to centre, right/below
     return result
 
 
-def auto_calibrate(frames):
+def auto_calibrate(frames, exhaustive=False):
     """
     Try to automatically find the court boundary line(s) and each one's
     IN side — works for a camera that only sees one corner (1-2 lines) as
     well as a camera placed behind the court seeing the whole thing (up to
     4 outer boundary lines, with any internal lines correctly ignored).
 
-    Scans the sharpest frames at several Hough sensitivities, collects
-    every line seen, deduplicates repeated detections of the same
-    physical line, then keeps only the outermost line(s) per orientation.
+    Scans frames at several Hough sensitivities, collects every line seen,
+    deduplicates repeated detections of the same physical line, then keeps
+    this court's boundary line(s) per orientation (see
+    _select_boundary_lines for how that's told apart from a shared
+    multi-court floor's other lines).
+
+    By default only the sharpest few frames are tried (fast — the normal
+    case). With exhaustive=True, every loaded frame is tried at a wider,
+    more sensitive range of Hough thresholds — a slower search used only
+    as a second automatic attempt when the fast pass finds nothing, so
+    manual line placement is never needed.
     """
     print("[AutoCalib] Scanning frames for sharpest …")
     order = sorted(range(len(frames)), key=lambda i: -_sharpness(frames[i]))
-    top_frames = order[:min(5, len(order))]
-    print(f"[AutoCalib] Trying {len(top_frames)} sharpest frames: {top_frames}")
+    top_frames = order if exhaustive else order[:min(5, len(order))]
+    thresholds = (60, 45, 32, 22, 15, 10) if exhaustive else (60, 45, 32, 22)
+    print(f"[AutoCalib] Trying {len(top_frames)} frame(s)"
+          f"{' (exhaustive)' if exhaustive else ': ' + str(top_frames)}")
 
     all_candidates = []
     for idx in top_frames:
         frame = frames[idx]
-        for hough_threshold in (60, 45, 32, 22):
+        for hough_threshold in thresholds:
             all_candidates.extend(_fit_candidates(frame, hough_threshold))
 
     if not all_candidates:
@@ -447,100 +540,11 @@ def auto_calibrate(frames):
         return []
 
     deduped = _dedupe_lines(all_candidates)
-    lines   = _select_boundary_lines(deduped)
+    lines   = _select_boundary_lines(deduped, frames[0].shape)
 
     for l in lines:
         print(f"[AutoCalib] {l['orientation']} boundary line "
               f"length={l['length']:.0f}px endpoints={l['endpoints']}")
-    return lines
-
-
-# ═══════════════════════════════════════════════════════════════════════
-#  Manual fallback (last resort — only line position(s) are clicked; the
-#  IN side of each is still determined automatically from colour)
-# ═══════════════════════════════════════════════════════════════════════
-
-def _manual_line_ui(frame):
-    """
-    Click up to 2 lines (2 points each). ENTER confirms after the 2nd or
-    4th point placed — so a single visible line still works, but a corner
-    view can capture both.
-    """
-    pts = []
-    win = "Calibration (click 2 points per line — up to 2 lines)"
-    cv2.namedWindow(win, cv2.WINDOW_NORMAL)
-    cv2.resizeWindow(win, 1280, 760)
-
-    def on_mouse(event, x, y, flags, param):
-        if event == cv2.EVENT_LBUTTONDOWN and len(pts) < 4:
-            pts.append((x, y))
-
-    cv2.setMouseCallback(win, on_mouse)
-
-    confirmed = False
-    while True:
-        disp = frame.copy()
-        for p in pts:
-            cv2.circle(disp, p, 6, (0, 255, 255), -1)
-        if len(pts) >= 2:
-            cv2.line(disp, pts[0], pts[1], (0, 255, 255), 2)
-        if len(pts) == 4:
-            cv2.line(disp, pts[2], pts[3], (0, 200, 255), 2)
-        cv2.putText(disp,
-                    "Click 2 pts/line (up to 2 lines).  ENTER=confirm  R=reset  ESC=cancel",
-                    (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2)
-        cv2.imshow(win, disp)
-        key = cv2.waitKey(16) & 0xFF
-
-        if key == 13 and len(pts) in (2, 4):
-            confirmed = True
-            break
-        elif key == 27:
-            break
-        elif key == ord('r'):
-            pts = []
-
-    cv2.destroyWindow(win)
-    if not confirmed:
-        return []
-
-    mask  = _white_line_mask(frame)
-    lines = []
-    for i in range(0, len(pts), 2):
-        point = np.array(pts[i], dtype=np.float64)
-        end   = np.array(pts[i+1], dtype=np.float64)
-        direction = end - point
-        length    = float(np.linalg.norm(direction))
-        if length < 1:
-            continue
-        direction /= length
-        endpoints = (pts[i], pts[i+1])
-        t_min, t_max = 0.0, length
-
-        # Snap the clicked line onto the true painted-line centre, same as
-        # the auto path, so a manually-placed line is just as sharp.
-        refined = _refine_centerline(mask, point, direction, t_min, t_max)
-        if refined is not None:
-            point, direction, t_min, t_max, thickness = refined
-            margin = min(MAX_MARGIN_PX, max(MIN_MARGIN_PX, thickness / 2.0))
-            p1 = point + direction*t_min
-            p2 = point + direction*t_max
-            endpoints = (tuple(int(v) for v in p1), tuple(int(v) for v in p2))
-        else:
-            margin = DEFAULT_MARGIN_PX
-
-        in_normal = _determine_in_side(frame, mask, point, direction, t_min, t_max)
-        if in_normal is None:
-            in_normal = np.array([-direction[1], direction[0]])
-            print("[Calibration] WARNING: could not auto-detect the IN side by "
-                  "colour for a manually-placed line — defaulted; verify the "
-                  "IN/OUT overlay looks correct.")
-
-        lines.append({
-            'point': point, 'direction': direction, 'normal': in_normal,
-            'endpoints': endpoints, 'length': length, 'margin': margin,
-            'orientation': _orientation(direction),
-        })
     return lines
 
 
@@ -555,11 +559,15 @@ def _apply(lines):
 
 def calibrate(cap):
     """
-    Fully automatic: detects the white boundary line(s) and which side of
-    each is IN, with no user interaction. Only if no line can be found at
-    all in any sampled frame does a minimal manual UI open (click 2 points
-    per line) — and even then, each line's IN side is still worked out
-    from colour automatically, never asked for.
+    Fully automatic, always — no manual line placement. Detects the white
+    boundary line(s) and which side of each is IN with no user interaction.
+
+    Tries a fast pass (sharpest few frames) first. If that finds nothing,
+    retries with an exhaustive pass (every loaded frame, wider Hough
+    sensitivity range) rather than asking for clicks. If even that finds
+    nothing, the system is left uncalibrated — IN/OUT calls are
+    unavailable until a later automatic attempt succeeds (e.g. via the
+    app's recalibrate key), never via manual line placement.
     """
     print("\n[Calibration] ──────────────────────────────────────────")
     print("  Loading frames …")
@@ -576,6 +584,11 @@ def calibrate(cap):
 
     lines = auto_calibrate(frames)
 
+    if not lines:
+        print("[Calibration] Fast pass found nothing — retrying with a wider "
+              "automatic search (every frame, more Hough sensitivities) …")
+        lines = auto_calibrate(frames, exhaustive=True)
+
     if lines:
         _apply(lines)
         _save()
@@ -584,24 +597,11 @@ def calibrate(cap):
         cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
         return True
 
-    # ── Last resort: no line detected in any frame at all ──────────
-    print("[Calibration] Could not detect any boundary line automatically.")
-    print("[Calibration] Opening manual UI …\n")
-
-    best_idx = int(np.argmax([_sharpness(f) for f in frames]))
-    lines = _manual_line_ui(frames[best_idx])
-
-    ok = bool(lines)
-    if ok:
-        _apply(lines)
-        _save()
-        print(f"[Calibration] Manual line(s) saved "
-              f"({len(lines)} line(s): {[l['orientation'] for l in lines]})\n")
-    else:
-        print("[Calibration] Cancelled.\n")
-
+    print("[Calibration] Automatic detection could not find any boundary line "
+          "in this footage. Continuing uncalibrated — IN/OUT calls are "
+          "unavailable until recalibration succeeds.\n")
     cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-    return ok
+    return False
 
 
 # ═══════════════════════════════════════════════════════════════════════

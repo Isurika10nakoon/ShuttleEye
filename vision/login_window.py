@@ -33,14 +33,32 @@ class LoginWindow(ctk.CTk):
         super().__init__()
         self.title("ShuttleEye — Login")
         self.geometry("440x560")
-        self.resizable(False, False)
+        self.resizable(True, True)
         self.configure(fg_color=BG)
         self.result = None  # (username, role) on success
+        self._fullscreen = False
 
         self._build_ui()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
+        self.bind("<F11>", lambda e: self._toggle_fullscreen())
+        self.bind("<Escape>", lambda e: self._set_fullscreen(False))
+
+    def _toggle_fullscreen(self):
+        self._set_fullscreen(not self._fullscreen)
+
+    def _set_fullscreen(self, value):
+        self._fullscreen = value
+        self.attributes("-fullscreen", value)
+        self._fs_btn.configure(text="🗗" if value else "⛶")
 
     def _build_ui(self):
+        self._fs_btn = ctk.CTkButton(
+            self, text="⛶", command=self._toggle_fullscreen,
+            width=34, height=34, corner_radius=8,
+            fg_color=CARD, hover_color=CARD2, text_color=TEXT_DIM,
+            font=(FONT_FAMILY, 14))
+        self._fs_btn.place(relx=1.0, x=-14, y=14, anchor="ne")
+
         card = ctk.CTkFrame(self, fg_color=CARD, corner_radius=20,
                              border_width=1, border_color=BORDER)
         card.pack(expand=True, fill="both", padx=32, pady=40)

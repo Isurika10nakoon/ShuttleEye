@@ -40,6 +40,9 @@ import time
 import datetime
 import queue
 
+import auth
+import db
+
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("blue")
 
@@ -73,7 +76,7 @@ class UmpireDashboard:
     BEST_OF        = 3          # match is best of 3 sets — 3rd set only
                                  # played if each side has won one set
 
-    def __init__(self, umpire_name="Umpire", role="umpire"):
+    def __init__(self, umpire_name="Umpire", role="umpire", court_name="Court 1"):
         self._q      = queue.Queue()   # thread-safe event queue
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._root   = None
@@ -81,6 +84,7 @@ class UmpireDashboard:
         # Session / login info
         self.umpire_name = umpire_name
         self.role        = role
+        self.court_name  = court_name
 
         # Match format — points needed to win a set (21 or 15), chosen by
         # the umpire before the match starts. Deuce/cap scale with it.
@@ -103,6 +107,12 @@ class UmpireDashboard:
         self._start_time = time.time()
         self._last_decision = None     # (decision, cm, px)
         self._set_num    = 1
+        self.status_text = ""          # plain-Python mirror of _status_var,
+                                        # safe to read from any thread (e.g.
+                                        # the web dashboard)
+
+        # Persistence — the DB row for the match currently in progress
+        self._match_id = None
 
     # ═══════════════════════════════════════════════════════════════
     #  Public API (thread-safe — safe to call from CV loop)
@@ -136,6 +146,67 @@ class UmpireDashboard:
         a mis-click). Score is clamped at 0."""
         self._q.put(("POINT_MINUS", side))
 
+    def toggle_serve(self):
+        """Flip which side is currently serving."""
+        self._q.put(("TOGGLE_SERVE", None))
+
+    def undo_last_point(self):
+        """Undo the most recent point change (an add or a subtract)."""
+        self._q.put(("UNDO", None))
+
+    def start_new_set(self, force=False):
+        """Force-start a new set. With force=False (the default) this is
+        ignored if the current set isn't finished — callers without a way
+        to show a confirmation prompt (e.g. a remote web client) should
+        confirm on their end first and pass force=True."""
+        self._q.put(("NEW_SET", force))
+
+    def reset_match(self, force=False):
+        """Reset the whole match. With force=False (the default) this is
+        ignored — callers without a way to show a confirmation prompt
+        should confirm on their end first and pass force=True."""
+        self._q.put(("RESET_MATCH", force))
+
+    def set_names(self, name_a, name_b):
+        """Set both player/team names directly."""
+        self._q.put(("SET_NAMES", (name_a, name_b)))
+
+    def set_match_format(self, points):
+        """Set the match format (21 or 15 points) directly. Ignored once
+        the match has already started."""
+        self._q.put(("SET_FORMAT", points))
+
+    def get_state(self):
+        """Thread-safe snapshot of the match state as plain data — used by
+        the web dashboard so an umpire's phone/tablet/laptop can mirror
+        the same match a separate device is running. Safe to call from
+        any thread; only reads plain Python attributes, never Tk widgets."""
+        return {
+            "umpire_name"    : self.umpire_name,
+            "role"           : self.role,
+            "court_name"     : self.court_name,
+            "name_a"         : self.name_a,
+            "name_b"         : self.name_b,
+            "score_a"        : self.score_a,
+            "score_b"        : self.score_b,
+            "sets_a"         : self.sets_a,
+            "sets_b"         : self.sets_b,
+            "set_history"    : list(self.set_history),
+            "serve"          : self.serve,
+            "set_num"        : self._set_num,
+            "game_over"      : self.game_over,
+            "set_over"       : self.set_over,
+            "status"         : self.status_text,
+            "winning_score"  : self.winning_score,
+            "elapsed_seconds": int(time.time() - self._start_time),
+            "last_decision"  : self._last_decision[0] if self._last_decision else None,
+        }
+
+    def export_log_text(self):
+        """Thread-safe: the rally log formatted as plain text, for the web
+        dashboard's export/download action."""
+        return "\n".join(self._export_lines())
+
     # ═══════════════════════════════════════════════════════════════
     #  Internal thread entry
     # ═══════════════════════════════════════════════════════════════
@@ -144,15 +215,46 @@ class UmpireDashboard:
         self._root = ctk.CTk()
         self._root.title("ShuttleEye  ─  Umpire Dashboard")
         self._root.configure(fg_color=BG)
-        self._root.geometry("640x800")
-        self._root.minsize(580, 700)
+        self._size_to_screen()
+        self._root.minsize(460, 600)  # still usable on small laptop screens
         self._root.protocol("WM_DELETE_WINDOW", self._on_close)
 
         self._build_ui()
+        self._root.bind("<Configure>", self._on_resize)
         self._prompt_match_format()
         self._poll_queue()
         self._tick_timer()
         self._root.mainloop()
+
+    def _size_to_screen(self):
+        """Scale the initial window to the screen it's opening on and
+        centre it, so the dashboard is usable on anything from a small
+        laptop panel to a large desktop monitor."""
+        sw = self._root.winfo_screenwidth()
+        sh = self._root.winfo_screenheight()
+        w  = max(460, min(720, int(sw * 0.40)))
+        h  = max(600, min(920, int(sh * 0.85)))
+        x  = (sw - w) // 2
+        y  = (sh - h) // 3
+        self._root.geometry(f"{w}x{h}+{x}+{y}")
+
+    def _on_resize(self, event):
+        if event.widget is not self._root:
+            return
+        if getattr(self, "_resize_after_id", None):
+            self._root.after_cancel(self._resize_after_id)
+        width = event.width
+        self._resize_after_id = self._root.after(80, lambda: self._apply_responsive_fonts(width))
+
+    def _apply_responsive_fonts(self, width):
+        """Scale the big score digits with window width so they stay
+        legible (and don't overflow) whether the window is small or huge."""
+        size = max(40, min(96, width // 7))
+        if getattr(self, "_score_font_size", None) == size:
+            return
+        self._score_font_size = size
+        self._score_a_label.configure(font=(FONT_FAMILY, size, "bold"))
+        self._score_b_label.configure(font=(FONT_FAMILY, size, "bold"))
 
     def _on_close(self):
         self._root.destroy()
@@ -171,7 +273,11 @@ class UmpireDashboard:
 
         ctk.CTkLabel(title_bar, text="🏸  ShuttleEye Umpire Dashboard",
                      font=(FONT_FAMILY, 18, "bold"),
-                     text_color=CYAN, fg_color="transparent").pack(side="left", padx=18)
+                     text_color=CYAN, fg_color="transparent").pack(side="left", padx=(18, 8))
+
+        ctk.CTkLabel(title_bar, text=f"🏟 {self.court_name}",
+                     font=(FONT_FAMILY, 11, "bold"),
+                     text_color=TEXT_DIM, fg_color="transparent").pack(side="left")
 
         role_badge = "ADMIN" if self.role == "admin" else "UMPIRE"
         badge_col  = YELLOW if self.role == "admin" else GREEN
@@ -336,24 +442,31 @@ class UmpireDashboard:
         self._point_btn(row2, "－ POINT  B", lambda: self.subtract_point("B"),
                   SCORE_B_COL, BG4, filled=False).pack(side="left", expand=True, fill="x", padx=3)
 
-        # Serve toggle / undo / reset
+        # Serve toggle / undo / reset — smaller than the point buttons,
+        # just enough to stay clearly visible
         row4 = ctk.CTkFrame(ctrl, fg_color="transparent");  row4.pack(fill="x", pady=3)
         self._btn(row4, "🔄 Toggle Serve", self._toggle_serve,
-                  TEXT_DIM).pack(side="left", expand=True, fill="x", padx=2)
+                  TEXT_DIM, height=38, font_size=12).pack(side="left", expand=True, fill="x", padx=2)
         self._btn(row4, "↩ Undo Last Pt", self._undo_point,
-                  ORANGE).pack(side="left", expand=True, fill="x", padx=2)
+                  ORANGE, height=38, font_size=12).pack(side="left", expand=True, fill="x", padx=2)
 
+        # New Set / Reset Match — solid fill so they stand out clearly,
+        # since these are higher-stakes actions the umpire needs to spot fast
         row5 = ctk.CTkFrame(ctrl, fg_color="transparent");  row5.pack(fill="x", pady=3)
-        self._btn(row5, "🔁 New Set", self._new_set,
-                  CYAN).pack(side="left", expand=True, fill="x", padx=2)
-        self._btn(row5, "🗑 Reset Match", self._reset_match,
-                  RED).pack(side="left", expand=True, fill="x", padx=2)
+        ctk.CTkButton(row5, text="🔁 New Set", command=self._new_set,
+                      text_color=WHITE, fg_color=CYAN, hover_color="#3d8bd6",
+                      corner_radius=10, font=(FONT_FAMILY, 12, "bold"),
+                      height=38).pack(side="left", expand=True, fill="x", padx=2)
+        ctk.CTkButton(row5, text="🗑 Reset Match", command=self._reset_match,
+                      text_color=WHITE, fg_color=RED, hover_color="#c9463c",
+                      corner_radius=10, font=(FONT_FAMILY, 12, "bold"),
+                      height=38).pack(side="left", expand=True, fill="x", padx=2)
 
         row6 = ctk.CTkFrame(ctrl, fg_color="transparent");  row6.pack(fill="x", pady=3)
         self._btn(row6, "💾 Export Log", self._export_log,
-                  TEXT_DIM).pack(side="left", expand=True, fill="x", padx=2)
+                  TEXT_DIM, height=30, font_size=10).pack(side="left", expand=True, fill="x", padx=2)
         self._btn(row6, "⚙ Match Format", self._change_match_format,
-                  TEXT_DIM).pack(side="left", expand=True, fill="x", padx=2)
+                  TEXT_DIM, height=30, font_size=10).pack(side="left", expand=True, fill="x", padx=2)
 
     # ── Right panel: rally log ────────────────────────────────────
 
@@ -400,25 +513,25 @@ class UmpireDashboard:
 
     # ── Widget helper ─────────────────────────────────────────────
 
-    def _btn(self, parent, text, cmd, accent):
+    def _btn(self, parent, text, cmd, accent, height=36, font_size=11):
         return ctk.CTkButton(parent, text=text, command=cmd,
                               text_color=accent, fg_color=BG3, hover_color=BG4,
                               corner_radius=8,
-                              font=(FONT_FAMILY, 11, "bold"),
-                              height=36)
+                              font=(FONT_FAMILY, font_size, "bold"),
+                              height=height)
 
     def _point_btn(self, parent, text, cmd, color, hover, filled=True):
         if filled:
             return ctk.CTkButton(parent, text=text, command=cmd,
                                   text_color=WHITE, fg_color=color, hover_color=hover,
                                   corner_radius=14,
-                                  font=(FONT_FAMILY, 20, "bold"),
-                                  height=78)
+                                  font=(FONT_FAMILY, 18, "bold"),
+                                  height=58)
         return ctk.CTkButton(parent, text=text, command=cmd,
                               text_color=color, fg_color="transparent", hover_color=hover,
                               corner_radius=14, border_width=2, border_color=color,
-                              font=(FONT_FAMILY, 20, "bold"),
-                              height=78)
+                              font=(FONT_FAMILY, 18, "bold"),
+                              height=58)
 
     # ═══════════════════════════════════════════════════════════════
     #  Queue polling (runs on Tkinter thread via after())
@@ -437,6 +550,22 @@ class UmpireDashboard:
                     self._apply_point(data)
                 elif event == "POINT_MINUS":
                     self._subtract_point(data)
+                elif event == "TOGGLE_SERVE":
+                    self._toggle_serve()
+                elif event == "UNDO":
+                    self._undo_point()
+                elif event == "NEW_SET":
+                    self._new_set(force=data)
+                elif event == "RESET_MATCH":
+                    self._reset_match(force=data)
+                elif event == "SET_NAMES":
+                    name_a, name_b = data
+                    self._set_names_internal(name_a, name_b)
+                elif event == "SET_FORMAT":
+                    if self._match_not_started():
+                        self._apply_match_format(data)
+                    else:
+                        self._flash_decision("Reset the match to change format", RED)
         except queue.Empty:
             pass
         self._root.after(50, self._poll_queue)
@@ -444,6 +573,15 @@ class UmpireDashboard:
     # ═══════════════════════════════════════════════════════════════
     #  Core logic
     # ═══════════════════════════════════════════════════════════════
+
+    def _db_call(self, fn, *args, **kwargs):
+        """Best-effort DB write — persistence must never take the live
+        match down if PostgreSQL is briefly unreachable."""
+        try:
+            return fn(*args, **kwargs)
+        except Exception as e:
+            print(f"[ShuttleEye] DB write failed ({fn.__name__}): {e}")
+            return None
 
     def _handle_decision(self, decision, cm, px):
         """
@@ -473,6 +611,7 @@ class UmpireDashboard:
         self._log_rally(side, decision if decision else "manual", cm=cm, note=note)
 
         self._check_set_over()
+        self._sync_live_score()
         self._refresh_ui()
 
     def _subtract_point(self, side):
@@ -495,7 +634,15 @@ class UmpireDashboard:
             self.score_b -= 1
 
         self._log_rally(side, "correction", note="point removed")
+        self._sync_live_score()
         self._refresh_ui()
+
+    def _sync_live_score(self):
+        """Push the current in-set score to the DB so the admin's
+        multi-court view stays near-live. Best-effort, non-blocking."""
+        if self._match_id is not None:
+            self._db_call(db.update_match_live_score,
+                           self._match_id, self.score_a, self.score_b, self._set_num)
 
     def _log_rally(self, side, decision, cm=None, note=""):
         rally_num = len(self.rally_log) + 1
@@ -515,6 +662,12 @@ class UmpireDashboard:
         self.rally_log.append(entry)
         self._add_log_row(entry)
 
+        if self._match_id is not None:
+            self._db_call(
+                db.record_rally, self._match_id, self._set_num, rally_num,
+                side, decision, cm_str, self.score_a, self.score_b, note,
+            )
+
     def _check_set_over(self):
         a, b = self.score_a, self.score_b
         won  = False
@@ -532,13 +685,20 @@ class UmpireDashboard:
             self.sets_b += 1
         self.set_history.append((a, b))
 
+        if self._match_id is not None:
+            self._db_call(db.record_set, self._match_id, self._set_num, a, b, winner)
+            self._db_call(db.update_match_progress, self._match_id, self.sets_a, self.sets_b)
+
         # Check match winner
         if self.sets_a > self.BEST_OF // 2 or self.sets_b > self.BEST_OF // 2:
             self.game_over = True
             self.set_over  = True
             match_winner   = self.name_a if self.sets_a > self.sets_b else self.name_b
-            self._status_var.set(f"🏆  {match_winner} WINS THE MATCH!")
+            self._set_status(f"🏆  {match_winner} WINS THE MATCH!")
             self._log_separator(f"MATCH WON BY {match_winner}")
+            if self._match_id is not None:
+                self._db_call(db.finish_match, self._match_id,
+                               self.sets_a, self.sets_b, match_winner)
         else:
             # Set is over but the match continues — automatically advance
             # to the next set, resetting the score to 0-0.
@@ -552,22 +712,30 @@ class UmpireDashboard:
         self.score_a    = 0
         self.score_b    = 0
         self.set_over   = False
-        self._status_var.set(f"Set {self._set_num} started")
+        self._set_status(f"Set {self._set_num} started")
         self._log_separator(f"─── SET {self._set_num} ───")
         self._undo_stack = []
+        self._sync_live_score()
 
-    def _new_set(self):
-        """Manual override — force-start a new set (e.g. to abandon the
-        current one early). Sets normally advance automatically once won."""
-        if not self.set_over and not self.game_over:
+    def _new_set(self, force=False):
+        """Force-start a new set (e.g. to abandon the current one early).
+        Sets normally advance automatically once won. With force=False
+        (local button clicks) an unfinished set asks for confirmation;
+        force=True (e.g. a remote web client that already confirmed on
+        its end) skips straight to it."""
+        if not force and not self.set_over and not self.game_over:
             if not messagebox.askyesno("New Set", "Current set not finished. Start new set anyway?"):
                 return
         self._start_next_set()
         self._refresh_ui()
 
-    def _reset_match(self):
-        if not messagebox.askyesno("Reset Match", "Reset all scores and rally log?"):
-            return
+    def _reset_match(self, force=False):
+        if not force:
+            if not messagebox.askyesno("Reset Match", "Reset all scores and rally log?"):
+                return
+        if self._match_id is not None and not self.game_over:
+            self._db_call(db.abandon_match, self._match_id, self.sets_a, self.sets_b)
+        self._match_id  = None
         self.score_a    = 0
         self.score_b    = 0
         self.sets_a     = 0
@@ -579,13 +747,17 @@ class UmpireDashboard:
         self._set_num   = 1
         self.rally_log  = []
         self._start_time= time.time()
-        self._status_var.set("")
+        self._set_status("")
         self._undo_stack= []
         self._log_list.delete(0, tk.END)
         self._refresh_ui()
         self._prompt_match_format()
 
     # ── Match format ─────────────────────────────────────────────
+
+    def _match_not_started(self):
+        return not (self.score_a or self.score_b or self.sets_a or self.sets_b
+                    or self._set_num != 1)
 
     def _apply_match_format(self, points):
         self.winning_score = points
@@ -594,12 +766,17 @@ class UmpireDashboard:
         self._format_var.set(f"🎯 Race to {points}")
         self._refresh_ui()
 
+        umpire_id = self._db_call(auth.get_user_id, self.umpire_name)
+        self._match_id = self._db_call(
+            db.create_match, umpire_id, self.umpire_name, self.court_name,
+            self.name_a, self.name_b, points,
+        )
+        self._sync_live_score()
+
     def _change_match_format(self):
         """Umpire-triggered format change — only allowed before the match
         has actually started (no points/sets played yet)."""
-        started = (self.score_a or self.score_b or self.sets_a or self.sets_b
-                   or self._set_num != 1)
-        if started:
+        if not self._match_not_started():
             self._flash_decision("Reset the match to change format", RED)
             return
         self._prompt_match_format()
@@ -657,7 +834,8 @@ class UmpireDashboard:
             self._log_list.delete(tk.END)
         self.set_over   = False
         self.game_over  = False
-        self._status_var.set("")
+        self._set_status("")
+        self._sync_live_score()
         self._refresh_ui()
 
     # ── Serve ─────────────────────────────────────────────────────
@@ -691,11 +869,7 @@ class UmpireDashboard:
         eb.grid(row=1, column=1, padx=10, pady=6)
 
         def _apply():
-            self.name_a = ea.get().strip() or "Player A"
-            self.name_b = eb.get().strip() or "Player B"
-            self._name_a_var.set(self.name_a)
-            self._name_b_var.set(self.name_b)
-            self._refresh_ui()
+            self._set_names_internal(ea.get(), eb.get())
             win.destroy()
 
         ctk.CTkButton(win, text="Save", command=_apply,
@@ -703,16 +877,18 @@ class UmpireDashboard:
                       corner_radius=8, font=(FONT_FAMILY, 12, "bold")).grid(
                       row=2, column=0, columnspan=2, pady=16)
 
+    def _set_names_internal(self, name_a, name_b):
+        self.name_a = (name_a or "").strip() or "Player A"
+        self.name_b = (name_b or "").strip() or "Player B"
+        self._name_a_var.set(self.name_a)
+        self._name_b_var.set(self.name_b)
+        self._refresh_ui()
+        if self._match_id is not None:
+            self._db_call(db.update_match_names, self._match_id, self.name_a, self.name_b)
+
     # ── Export ────────────────────────────────────────────────────
 
-    def _export_log(self):
-        path = filedialog.asksaveasfilename(
-            defaultextension=".txt",
-            filetypes=[("Text files", "*.txt"), ("All files", "*.*")],
-            initialfile=f"shuttleeye_rally_log_{datetime.date.today()}.txt"
-        )
-        if not path:
-            return
+    def _export_lines(self):
         lines = [
             "ShuttleEye — Umpire Rally Log",
             f"Date: {datetime.date.today()}",
@@ -729,10 +905,19 @@ class UmpireDashboard:
             if e['note']:
                 line += f"  [{e['note']}]"
             lines.append(line)
+        return lines
 
+    def _export_log(self):
+        path = filedialog.asksaveasfilename(
+            defaultextension=".txt",
+            filetypes=[("Text files", "*.txt"), ("All files", "*.*")],
+            initialfile=f"shuttleeye_rally_log_{datetime.date.today()}.txt"
+        )
+        if not path:
+            return
         with open(path, "w", encoding="utf-8") as f:
-            f.write("\n".join(lines))
-        self._flash_decision(f"Log saved", GREEN)
+            f.write("\n".join(self._export_lines()))
+        self._flash_decision("Log saved", GREEN)
 
     # ═══════════════════════════════════════════════════════════════
     #  UI refresh
@@ -746,13 +931,13 @@ class UmpireDashboard:
         # Deuce / advantage status
         if a >= self.deuce_score and b >= self.deuce_score:
             if a == b:
-                self._status_var.set("DEUCE")
+                self._set_status("DEUCE")
             elif a > b:
-                self._status_var.set(f"ADVANTAGE  {self.name_a}")
+                self._set_status(f"ADVANTAGE  {self.name_a}")
             else:
-                self._status_var.set(f"ADVANTAGE  {self.name_b}")
+                self._set_status(f"ADVANTAGE  {self.name_b}")
         elif not self.set_over and not self.game_over:
-            self._status_var.set("")
+            self._set_status("")
 
         # Score label flash colour
         self._score_a_label.configure(
@@ -809,6 +994,12 @@ class UmpireDashboard:
         self._decision_lbl.configure(text_color=color)
         # Clear after 2.5 s
         self._root.after(2500, lambda: self._decision_var.set(""))
+
+    def _set_status(self, text):
+        """Update the status label and its plain-Python mirror
+        (self.status_text) that other threads/the web dashboard read."""
+        self.status_text = text
+        self._status_var.set(text)
 
     # ═══════════════════════════════════════════════════════════════
     #  Timer
