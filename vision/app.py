@@ -1,4 +1,4 @@
-# app.py  —  ShuttleEye v5  —  First-Touch + Umpire Dashboard
+# app.py  —  ShuttleEye  —  First-Touch + Umpire Dashboard
 # ═══════════════════════════════════════════════════════════════════
 #  KEYBOARD  (CV window)
 #  ───────────────────
@@ -6,6 +6,7 @@
 #  C   re-calibrate  (manual override)
 #  P   pause / resume
 #  D   toggle debug HUD
+#  F   toggle fullscreen
 #  S   print session stats to console
 # ═══════════════════════════════════════════════════════════════════
 
@@ -60,9 +61,13 @@ judge   = LineJudge(on_decision=_on_decision)
 prev_time  = time.time()
 paused     = False
 show_debug = False
+fullscreen = False
 
-print("\n[ShuttleEye v5] Running")
-print("  Q=quit  C=calibrate  P=pause  D=debug  S=stats\n")
+WINDOW_NAME = "ShuttleEye"
+cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
+
+print("\n[ShuttleEye] Running")
+print("  Q=quit  C=calibrate  P=pause  D=debug  F=fullscreen  S=stats\n")
 
 
 def _draw_debug(frame, lander):
@@ -105,6 +110,13 @@ while True:
     elif key == ord('d'):
         show_debug = not show_debug
         print("[ShuttleEye] Debug", "ON" if show_debug else "OFF")
+
+    elif key == ord('f'):
+        fullscreen = not fullscreen
+        cv2.setWindowProperty(
+            WINDOW_NAME, cv2.WND_PROP_FULLSCREEN,
+            cv2.WINDOW_FULLSCREEN if fullscreen else cv2.WINDOW_NORMAL)
+        print("[ShuttleEye] Fullscreen", "ON" if fullscreen else "OFF")
 
     elif key == ord('s'):
         total, ins, outs = judge.get_stats()
@@ -153,21 +165,12 @@ while True:
 
     cv2.putText(frame, f"FPS: {int(fps)}",
                 (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1, (0,255,0), 2)
-    cv2.putText(frame, "ShuttleEye v5",
+    cv2.putText(frame, "ShuttleEye",
                 (20, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,255,255), 2)
 
-    # Score mirror from dashboard
-    a, b = dashboard.score_a, dashboard.score_b
-    cv2.putText(frame, f"{dashboard.name_a} {a} – {b} {dashboard.name_b}",
+    # Player names (no live score here — the umpire dashboard owns that)
+    cv2.putText(frame, f"{dashboard.name_a} vs {dashboard.name_b}",
                 (20, 116), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255,220,80), 2)
-
-    if shuttle_pos:
-        offs = calibration.line_offsets(*shuttle_pos)
-        if offs:
-            dist = offs[0]
-            cv2.putText(frame,
-                        f"Shuttle: px{shuttle_pos}  {dist:+.0f}px from line",
-                        (20, 148), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0,255,255), 2)
 
     if show_debug:
         _draw_debug(frame, lander)
@@ -177,7 +180,7 @@ while True:
                     (frame.shape[1]//2-80, frame.shape[0]//2),
                     cv2.FONT_HERSHEY_DUPLEX, 2, (0,200,255), 4)
 
-    cv2.imshow("ShuttleEye", frame)
+    cv2.imshow(WINDOW_NAME, frame)
 
 cap.release()
 cv2.destroyAllWindows()
