@@ -24,6 +24,7 @@ from flask import Flask, jsonify, request, session, redirect, url_for, Response
 
 import auth
 import db
+import bracket
 
 DEFAULT_PORT = 8080
 
@@ -76,6 +77,22 @@ def create_app(dashboard):
         if not is_admin():
             return redirect(url_for("index"))
         return Response(ADMIN_HTML, mimetype="text/html")
+
+    @app.get("/admin/tournaments")
+    def tournaments_page():
+        if not logged_in():
+            return redirect(url_for("login"))
+        if not is_admin():
+            return redirect(url_for("index"))
+        return Response(TOURNAMENTS_HTML, mimetype="text/html")
+
+    @app.get("/admin/tournaments/<int:tournament_id>")
+    def tournament_detail_page(tournament_id):
+        if not logged_in():
+            return redirect(url_for("login"))
+        if not is_admin():
+            return redirect(url_for("index"))
+        return Response(TOURNAMENT_DETAIL_HTML, mimetype="text/html")
 
     @app.get("/board")
     def board_page():
@@ -146,6 +163,92 @@ def create_app(dashboard):
                 if row.get(key) is not None:
                     row[key] = row[key].isoformat()
         return jsonify(active=active, recent=recent)
+
+    @app.get("/api/tournaments")
+    def api_tournaments_list():
+        unauthorized = require_admin()
+        if unauthorized:
+            return unauthorized
+        rows = [dict(r) for r in db.list_tournaments()]
+        for row in rows:
+            row["created_at"] = row["created_at"].isoformat()
+        return jsonify(tournaments=rows)
+
+    @app.post("/api/tournaments")
+    def api_tournaments_create():
+        unauthorized = require_admin()
+        if unauthorized:
+            return unauthorized
+        data = request.get_json(silent=True) or {}
+        name = (data.get("name") or "").strip()
+        if not name:
+            return jsonify(ok=False, error="Tournament name is required."), 400
+        creator_id = auth.get_user_id(session["username"])
+        tid = bracket.create_tournament(name, creator_id)
+        return jsonify(ok=True, id=tid)
+
+    @app.get("/api/tournaments/<int:tournament_id>")
+    def api_tournament_detail(tournament_id):
+        unauthorized = require_admin()
+        if unauthorized:
+            return unauthorized
+        tournament = db.get_tournament(tournament_id)
+        if tournament is None:
+            return jsonify(ok=False, error="Tournament not found."), 404
+        tournament = dict(tournament)
+        tournament["created_at"] = tournament["created_at"].isoformat()
+        participants = [dict(p) for p in db.list_participants(tournament_id)]
+        for p in participants:
+            p["created_at"] = p["created_at"].isoformat()
+        slots = [dict(s) for s in db.get_bracket(tournament_id)]
+        return jsonify(tournament=tournament, participants=participants, slots=slots)
+
+    @app.post("/api/tournaments/<int:tournament_id>/participants")
+    def api_add_participant(tournament_id):
+        unauthorized = require_admin()
+        if unauthorized:
+            return unauthorized
+        data = request.get_json(silent=True) or {}
+        try:
+            pid = bracket.add_participant(tournament_id, data.get("name", ""))
+        except ValueError as e:
+            return jsonify(ok=False, error=str(e)), 400
+        return jsonify(ok=True, id=pid)
+
+    @app.post("/api/tournaments/<int:tournament_id>/participants/<int:participant_id>/remove")
+    def api_remove_participant(tournament_id, participant_id):
+        unauthorized = require_admin()
+        if unauthorized:
+            return unauthorized
+        db.remove_participant(participant_id)
+        return jsonify(ok=True)
+
+    @app.post("/api/tournaments/<int:tournament_id>/generate")
+    def api_generate_bracket(tournament_id):
+        unauthorized = require_admin()
+        if unauthorized:
+            return unauthorized
+        try:
+            bracket.generate_bracket(tournament_id)
+        except ValueError as e:
+            return jsonify(ok=False, error=str(e)), 400
+        return jsonify(ok=True)
+
+    @app.post("/api/tournaments/<int:tournament_id>/assign")
+    def api_assign_slot(tournament_id):
+        unauthorized = require_admin()
+        if unauthorized:
+            return unauthorized
+        data = request.get_json(silent=True) or {}
+        slot_id = data.get("slot_id")
+        court_name = (data.get("court_name") or "").strip()
+        if not slot_id or not court_name:
+            return jsonify(ok=False, error="slot_id and court_name are required."), 400
+        ok = db.assign_slot_to_court(slot_id, court_name)
+        if not ok:
+            return jsonify(ok=False, error="Slot isn't ready to be assigned (already played, "
+                                            "already assigned, or missing a participant)."), 400
+        return jsonify(ok=True)
 
     @app.get("/api/state")
     def api_state():
@@ -311,6 +414,33 @@ label{font-size:.75rem;color:#8b949e;}
 .recent-row:last-child{border-bottom:none;}
 .recent-row .win{color:#3fb950;} .recent-row .aband{color:#8b949e;}
 .empty{color:#8b949e;font-size:.9rem;text-align:center;padding:12px;}
+
+/* Admin — tournaments / bracket */
+.t-row{display:flex;justify-content:space-between;align-items:center;padding:10px 0;
+       border-bottom:1px solid #30363d;}
+.t-row:last-child{border-bottom:none;}
+.t-row a{color:#e6edf3;text-decoration:none;font-weight:bold;}
+.t-status{font-size:.7rem;font-weight:bold;padding:3px 8px;border-radius:6px;background:#21262d;}
+.t-status.draft{color:#8b949e;} .t-status.active{color:#d29922;} .t-status.completed{color:#3fb950;}
+.pill{display:inline-flex;align-items:center;gap:6px;background:#21262d;border-radius:20px;
+      padding:6px 8px 6px 14px;margin:4px 6px 4px 0;font-size:.85rem;}
+.pill button{flex:none;background:none;border:none;color:#f85149;font-size:1rem;padding:2px 6px;
+             border-radius:50%;cursor:pointer;}
+.inline-form{display:flex;gap:8px;margin-top:10px;}
+.inline-form input{margin-bottom:0;flex:1;}
+.inline-form button{flex:none;width:auto;padding:12px 18px;}
+.bracket{display:flex;gap:16px;overflow-x:auto;padding-bottom:8px;}
+.round-col{flex:0 0 220px;}
+.round-title{font-size:.75rem;color:#8b949e;font-weight:bold;margin-bottom:8px;text-align:center;}
+.slot{background:#161b22;border:1px solid #30363d;border-radius:10px;padding:10px;margin-bottom:14px;}
+.slot .side{display:flex;justify-content:space-between;padding:3px 0;font-size:.9rem;}
+.slot .side.winner{color:#3fb950;font-weight:bold;}
+.slot .side.tbd{color:#8b949e;font-style:italic;}
+.slot .meta-row{font-size:.7rem;color:#8b949e;margin-top:6px;display:flex;justify-content:space-between;
+                 align-items:center;}
+.slot .assign-btn{background:#21262d;color:#58a6ff;border:none;border-radius:6px;
+                   padding:4px 8px;font-size:.7rem;cursor:pointer;}
+.back-link{color:#58a6ff;font-size:.85rem;text-decoration:none;display:inline-block;margin-bottom:10px;}
 """
 
 LOGIN_HTML = f"""<!doctype html><html><head><meta charset="utf-8">
@@ -492,6 +622,7 @@ ADMIN_HTML = f"""<!doctype html><html><head><meta charset="utf-8">
 </div>
 
 <div class="btn-row">
+  <button class="util" style="flex:1" onclick="window.location='/admin/tournaments'">🏆 Tournaments</button>
   <button class="util" style="flex:1" onclick="logout()">🚪 Log Out</button>
 </div>
 </div>
@@ -632,5 +763,216 @@ async function refresh(){
 
 refresh();
 setInterval(refresh, 1500);
+</script>
+</body></html>"""
+
+TOURNAMENTS_HTML = f"""<!doctype html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+<title>ShuttleEye — Tournaments</title><style>{_STYLE}</style></head>
+<body><div class="wrap admin-wrap">
+<a class="back-link" href="/admin">← All Courts</a>
+<div class="topbar">
+  <div><h1>🏆 Tournaments</h1><div class="sub">Create a bracket, then assign matches to courts</div></div>
+  <div class="badge admin">ADMIN</div>
+</div>
+
+<div class="card">
+  <div class="sub" style="margin-bottom:6px">NEW TOURNAMENT</div>
+  <div class="inline-form">
+    <input id="newName" placeholder="e.g. Summer Open 2026">
+    <button class="pt-a" onclick="createTournament()">Create</button>
+  </div>
+  <div class="err" id="err"></div>
+</div>
+
+<div class="card">
+  <div class="sub" style="margin-bottom:6px">ALL TOURNAMENTS</div>
+  <div id="list"><div class="empty">Loading…</div></div>
+</div>
+</div>
+
+<script>
+function escapeHtml(s){{
+  return String(s).replace(/[&<>"]/g, c => ({{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}}[c]));
+}}
+
+async function refresh(){{
+  const res = await fetch('/api/tournaments');
+  if (res.status === 401) {{ location.href = '/login'; return; }}
+  if (res.status === 403) {{ location.href = '/'; return; }}
+  const data = await res.json();
+  const listEl = document.getElementById('list');
+  if (!data.tournaments.length) {{
+    listEl.innerHTML = '<div class="empty">No tournaments yet — create one above.</div>';
+    return;
+  }}
+  listEl.innerHTML = data.tournaments.map(t => `
+    <div class="t-row">
+      <a href="/admin/tournaments/${{t.id}}">${{escapeHtml(t.name)}}</a>
+      <span class="t-status ${{t.status}}">${{t.status.toUpperCase()}}</span>
+    </div>`).join('');
+}}
+
+async function createTournament(){{
+  const name = document.getElementById('newName').value;
+  const res = await fetch('/api/tournaments', {{method:'POST', headers:{{'Content-Type':'application/json'}},
+                                                body: JSON.stringify({{name}})}});
+  const data = await res.json();
+  if (data.ok) {{ location.href = '/admin/tournaments/' + data.id; }}
+  else {{ document.getElementById('err').textContent = data.error || 'Could not create tournament'; }}
+}}
+
+refresh();
+</script>
+</body></html>"""
+
+TOURNAMENT_DETAIL_HTML = f"""<!doctype html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+<title>ShuttleEye — Bracket</title><style>{_STYLE}</style></head>
+<body><div class="wrap admin-wrap">
+<a class="back-link" href="/admin/tournaments">← Tournaments</a>
+<div class="topbar">
+  <div><h1 id="tName">🏆 …</h1><div class="sub" id="tStatus"></div></div>
+  <div class="badge admin">ADMIN</div>
+</div>
+
+<div class="card" id="participantsCard" style="display:none">
+  <div class="sub" style="margin-bottom:8px">PARTICIPANTS</div>
+  <div id="participants"></div>
+  <div class="inline-form">
+    <input id="newParticipant" placeholder="Player or team name">
+    <button class="pt-a" onclick="addParticipant()">Add</button>
+  </div>
+  <div class="err" id="pErr"></div>
+  <div class="btn-row" style="margin-top:14px">
+    <button class="util new-set" style="flex:1" id="genBtn" onclick="generate()">🔁 Generate Bracket</button>
+  </div>
+</div>
+
+<div class="card" id="winnerCard" style="display:none">
+  <div class="gameover" id="winnerText"></div>
+</div>
+
+<div class="card" id="bracketCard" style="display:none">
+  <div class="sub" style="margin-bottom:8px">BRACKET</div>
+  <div class="bracket" id="bracket"></div>
+</div>
+</div>
+
+<script>
+const tid = location.pathname.split('/').filter(Boolean).pop();
+function escapeHtml(s){{
+  return String(s).replace(/[&<>"]/g, c => ({{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}}[c]));
+}}
+
+async function refresh(){{
+  const res = await fetch('/api/tournaments/' + tid);
+  if (res.status === 401) {{ location.href = '/login'; return; }}
+  if (res.status === 403) {{ location.href = '/'; return; }}
+  if (res.status === 404) {{ document.body.innerHTML = '<div class="wrap"><div class="empty">Tournament not found.</div></div>'; return; }}
+  const data = await res.json();
+  const t = data.tournament;
+
+  document.getElementById('tName').textContent = '🏆 ' + t.name;
+  document.getElementById('tStatus').textContent = t.status.toUpperCase()
+    + (t.status === 'completed' ? ' — winner: ' + t.winner_name : '');
+
+  if (t.status === 'draft') {{
+    document.getElementById('participantsCard').style.display = 'block';
+    document.getElementById('participants').innerHTML = data.participants.length
+      ? data.participants.map(p => `
+          <span class="pill">${{escapeHtml(p.name)}}
+            <button onclick="removeParticipant(${{p.id}})" title="Remove">×</button>
+          </span>`).join('')
+      : '<div class="empty">No participants yet.</div>';
+    const genBtn = document.getElementById('genBtn');
+    genBtn.disabled = data.participants.length < 2;
+    genBtn.style.opacity = data.participants.length < 2 ? 0.5 : 1;
+  }} else {{
+    document.getElementById('participantsCard').style.display = 'none';
+  }}
+
+  if (t.status === 'completed') {{
+    document.getElementById('winnerCard').style.display = 'block';
+    document.getElementById('winnerText').textContent = '🏆 ' + t.winner_name + ' wins the tournament!';
+  }}
+
+  if (t.status !== 'draft') {{
+    document.getElementById('bracketCard').style.display = 'block';
+    renderBracket(data.slots);
+  }}
+}}
+
+function slotLine(slot, side){{
+  const name = side === 'a' ? slot.name_a : slot.name_b;
+  const isWinner = slot.winner_participant_id && slot.winner_participant_id ===
+    (side === 'a' ? slot.participant_a_id : slot.participant_b_id);
+  const cls = name === null ? 'tbd' : (isWinner ? 'winner' : '');
+  return `<div class="side ${{cls}}">${{name ? escapeHtml(name) : 'TBD'}}</div>`;
+}}
+
+function renderBracket(slots){{
+  const rounds = {{}};
+  slots.forEach(s => {{ (rounds[s.round_num] = rounds[s.round_num] || []).push(s); }});
+  const roundNums = Object.keys(rounds).map(Number).sort((a,b)=>a-b);
+  const maxRound = roundNums[roundNums.length - 1];
+
+  document.getElementById('bracket').innerHTML = roundNums.map(rnd => {{
+    const title = rnd === maxRound ? 'FINAL' : (rnd === maxRound - 1 ? 'SEMIFINALS' : 'ROUND ' + rnd);
+    const slotsHtml = rounds[rnd].map(s => {{
+      let meta = '';
+      if (s.status === 'bye') {{
+        meta = '<div class="meta-row"><span>bye</span></div>';
+      }} else if (s.status === 'pending' && s.participant_a_id && s.participant_b_id) {{
+        meta = `<div class="meta-row"><span>not assigned</span>
+                  <button class="assign-btn" onclick="promptAssign(${{s.id}})">Assign to court</button></div>`;
+      }} else if (s.status === 'ready') {{
+        meta = `<div class="meta-row"><span>📍 ${{escapeHtml(s.court_name)}} — waiting</span></div>`;
+      }} else if (s.status === 'in_progress') {{
+        meta = `<div class="meta-row"><span>▶ live on ${{escapeHtml(s.court_name)}}</span></div>`;
+      }} else if (s.status === 'completed') {{
+        meta = '<div class="meta-row"><span>✓ completed</span></div>';
+      }}
+      return `<div class="slot">${{slotLine(s,'a')}}${{slotLine(s,'b')}}${{meta}}</div>`;
+    }}).join('');
+    return `<div class="round-col"><div class="round-title">${{title}}</div>${{slotsHtml}}</div>`;
+  }}).join('');
+}}
+
+async function addParticipant(){{
+  const name = document.getElementById('newParticipant').value;
+  const res = await fetch(`/api/tournaments/${{tid}}/participants`, {{
+    method:'POST', headers:{{'Content-Type':'application/json'}}, body: JSON.stringify({{name}})}});
+  const data = await res.json();
+  if (data.ok) {{ document.getElementById('newParticipant').value = ''; document.getElementById('pErr').textContent=''; refresh(); }}
+  else {{ document.getElementById('pErr').textContent = data.error || 'Could not add participant'; }}
+}}
+
+async function removeParticipant(pid){{
+  await fetch(`/api/tournaments/${{tid}}/participants/${{pid}}/remove`, {{method:'POST'}});
+  refresh();
+}}
+
+async function generate(){{
+  if (!confirm('Generate the bracket? Participants can\\'t be changed after this.')) return;
+  const res = await fetch(`/api/tournaments/${{tid}}/generate`, {{method:'POST'}});
+  const data = await res.json();
+  if (data.ok) {{ refresh(); }}
+  else {{ document.getElementById('pErr').textContent = data.error || 'Could not generate bracket'; }}
+}}
+
+async function promptAssign(slotId){{
+  const court = prompt('Court name to assign this match to (must match the court exactly, e.g. "Court 1"):');
+  if (!court) return;
+  const res = await fetch(`/api/tournaments/${{tid}}/assign`, {{
+    method:'POST', headers:{{'Content-Type':'application/json'}},
+    body: JSON.stringify({{slot_id: slotId, court_name: court}})}});
+  const data = await res.json();
+  if (data.ok) {{ refresh(); }}
+  else {{ alert(data.error || 'Could not assign court'); }}
+}}
+
+refresh();
+setInterval(refresh, 3000);
 </script>
 </body></html>"""

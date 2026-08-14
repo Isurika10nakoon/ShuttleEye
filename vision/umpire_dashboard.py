@@ -43,6 +43,7 @@ import webbrowser
 
 import auth
 import db
+import bracket
 
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("blue")
@@ -118,6 +119,12 @@ class UmpireDashboard:
 
         # Persistence — the DB row for the match currently in progress
         self._match_id = None
+
+        # Set if this court has a tournament bracket match waiting to be
+        # played — see _apply_match_format, which auto-fills the player
+        # names from it, and _check_set_over, which reports the result
+        # back to the bracket once the match finishes.
+        self._bracket_slot = None
 
     # ═══════════════════════════════════════════════════════════════
     #  Public API (thread-safe — safe to call from CV loop)
@@ -709,14 +716,17 @@ class UmpireDashboard:
 
         # Check match winner
         if self.sets_a > self.BEST_OF // 2 or self.sets_b > self.BEST_OF // 2:
-            self.game_over = True
-            self.set_over  = True
-            match_winner   = self.name_a if self.sets_a > self.sets_b else self.name_b
+            self.game_over   = True
+            self.set_over    = True
+            winner_side      = "A" if self.sets_a > self.sets_b else "B"
+            match_winner     = self.name_a if winner_side == "A" else self.name_b
             self._set_status(f"🏆  {match_winner} WINS THE MATCH!")
             self._log_separator(f"MATCH WON BY {match_winner}")
             if self._match_id is not None:
                 self._db_call(db.finish_match, self._match_id,
                                self.sets_a, self.sets_b, match_winner)
+            if self._bracket_slot is not None:
+                self._db_call(bracket.report_slot_result, self._bracket_slot, winner_side)
         else:
             # Set is over but the match continues — automatically advance
             # to the next set, resetting the score to 0-0.
@@ -753,7 +763,8 @@ class UmpireDashboard:
                 return
         if self._match_id is not None and not self.game_over:
             self._db_call(db.abandon_match, self._match_id, self.sets_a, self.sets_b)
-        self._match_id  = None
+        self._match_id     = None
+        self._bracket_slot = None
         self.score_a    = 0
         self.score_b    = 0
         self.sets_a     = 0
@@ -782,6 +793,15 @@ class UmpireDashboard:
         self.deuce_score   = points - 1
         self.max_score     = points + 9
         self._format_var.set(f"🎯 Race to {points}")
+
+        # If a tournament admin has assigned this court a bracket match,
+        # pull the two names in automatically instead of Player A/B.
+        self._bracket_slot = self._db_call(db.get_ready_slot_for_court, self.court_name)
+        if self._bracket_slot is not None:
+            self._set_names_internal(self._bracket_slot["name_a"], self._bracket_slot["name_b"])
+            self._flash_decision(
+                f"🏆 {self._bracket_slot['name_a']} vs {self._bracket_slot['name_b']}", CYAN)
+
         self._refresh_ui()
 
         umpire_id = self._db_call(auth.get_user_id, self.umpire_name)
@@ -790,6 +810,8 @@ class UmpireDashboard:
             self.name_a, self.name_b, points,
         )
         self._sync_live_score()
+        if self._bracket_slot is not None and self._match_id is not None:
+            self._db_call(db.link_match_to_slot, self._bracket_slot["id"], self._match_id)
 
     def _change_match_format(self):
         """Umpire-triggered format change — only allowed before the match
