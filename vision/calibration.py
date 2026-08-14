@@ -15,14 +15,23 @@
 #      lines, and buckets them as roughly-horizontal ('H') or
 #      roughly-vertical ('V') in the frame.
 #
-#   2. Rejects any candidate whose surroundings aren't a real floor —
-#      a genuine boundary line separates two FLAT surfaces (court paint
-#      vs. floor/outside). The net's white top tape sits directly above
-#      the mesh webbing, which has fine grid texture no matter its exact
-#      colour, so it measures as high local edge-energy and gets rejected
-#      here — this is what keeps the net out even though it's just as
-#      white and line-shaped as a real floor line, and even if perspective
-#      would otherwise make it look like an outer boundary line (see 3).
+#   2. Rejects any candidate that isn't painted CONTINUOUSLY along its own
+#      length. A real boundary line is one continuous stripe of paint (bar
+#      the odd scuff or shadow); the net's white top tape is not — strung
+#      between two posts, it sags, self-shadows, and lets the mesh and
+#      background show through at an angle, so it comes apart into shorter
+#      fragments in the same white-pixel mask a real line stays solid in.
+#      Measured by walking the fitted line and checking how much of it is
+#      actually covered by a contiguous run of mask pixels (small gaps —
+#      a shadow, a shoe — are bridged; large ones aren't). This is what
+#      keeps the net out even though it's just as white and line-shaped as
+#      a real floor line, and even if perspective would otherwise make it
+#      look like an outer boundary line (see 3). (An earlier version tried
+#      to tell the net apart by local pixel texture — high edge-energy
+#      near the mesh — but on a real glossy indoor floor under uneven gym
+#      lighting, glare/reflections/wood-grain measured just as textured as
+#      the net itself, sometimes more so, making that signal useless; this
+#      continuity check is about the line's own paint, not its surroundings.)
 #
 #   3. For each orientation there may be several remaining parallel lines
 #      in a full-court view (e.g. near baseline, service lines, far
@@ -87,18 +96,23 @@ MIN_LINE_LEN_FRAC = 0.15
 SAMPLE_OFFSET_PX = 25
 SAMPLE_PATCH     = 9   # odd side length of each colour-sample patch
 
-# A genuine court boundary separates two flat, unmarked surfaces (court
-# paint vs. floor/court paint vs. outside). If either side of a candidate
-# line has fine texture — many small edges, like a grid — it isn't really
-# bordering a flat surface. This is what specifically excludes the net:
-# the white top tape sits directly above the mesh webbing, whose grid
-# pattern reads as high local edge-energy no matter its exact colour.
-# Same test also screens out lines bordering spectators/foliage/signage.
-# Measured the same way frame sharpness already is elsewhere in this file
-# (Laplacian variance) but over a wider window, since a texture pattern
-# needs more area to show up in than a single colour-sample patch does.
-TEXTURE_WINDOW    = 21     # odd side length of the texture-sample window
-MAX_SIDE_TEXTURE  = 150.0  # Laplacian variance
+# A genuine boundary line is painted as one continuous stripe. The net's
+# top tape, strung between two posts, comes apart into shorter fragments
+# in the white-pixel mask (sag, self-shadowing, mesh/background showing
+# through) — this is what specifically excludes it. Checked by walking
+# the fitted line and measuring the longest contiguous run of mask hits,
+# as a fraction of the line's own length; gaps up to COVERAGE_GAP_BRIDGE_PX
+# are bridged (a shadow or a shoe crossing the line shouldn't count against
+# it), bigger gaps aren't. A candidate below MIN_COVERAGE_RATIO is dropped.
+COVERAGE_TOL_PX        = 3    # perpendicular tolerance for a "hit"
+COVERAGE_GAP_BRIDGE_PX = 6    # along-line gap size still bridged
+MIN_COVERAGE_RATIO     = 0.70
+
+# In boundary selection, a candidate shorter than this fraction of the
+# longest candidate in its own H/V group is treated as an internal marking
+# (e.g. the centre service line), not a real boundary — see
+# _select_boundary_lines.
+MIN_GROUP_LEN_FRAC = 0.5
 
 # White court line: low colour saturation. (Brightness is judged locally,
 # not by a fixed floor here — see _white_line_mask.)
@@ -226,12 +240,30 @@ def _fit_line(segs):
     return point, direction, t_min, t_max, endpoints
 
 
+HORIZONTAL_MAX_DEG = 15.0   # see _orientation
+
 def _orientation(direction):
-    """Buckets a line direction as 'H' (nearer horizontal) or 'V' (nearer vertical)."""
+    """
+    Buckets a line direction as 'H' (a back/front boundary line -- runs
+    laterally across the shot, close to horizontal) or 'V' (a sideline --
+    runs away from the camera toward the net).
+
+    Deliberately NOT a 45/45 split. For the camera placement this module
+    targets ("behind the court, sees the whole court"), a real sideline
+    recedes toward a vanishing point and is usually tilted well short of
+    vertical in image space -- 30-40 degrees off horizontal is typical,
+    sometimes less. A 45/45 split buckets those as 'H', where they collide
+    with the genuine horizontal boundary line during selection (and can
+    crowd it out entirely) instead of being bracketed against the OTHER
+    sideline the way a 'V' candidate would be. Only lines within
+    HORIZONTAL_MAX_DEG of true horizontal -- which a back/front boundary
+    line always is, since it runs side-to-side across the shot rather than
+    receding into it -- are called 'H'; everything else, including a
+    fairly shallow sideline, is 'V'.
+    """
     angle  = abs(np.degrees(np.arctan2(direction[1], direction[0]))) % 180
     dist_h = min(angle, abs(180 - angle))   # distance from 0°/180°
-    dist_v = abs(angle - 90)                # distance from 90°
-    return 'H' if dist_h < dist_v else 'V'
+    return 'H' if dist_h < HORIZONTAL_MAX_DEG else 'V'
 
 
 def _refine_centerline(mask, point, direction, t_min, t_max, search_radius=15):
@@ -283,8 +315,71 @@ def _refine_centerline(mask, point, direction, t_min, t_max, search_radius=15):
     new_point = np.array([x0, y0], dtype=np.float64)
 
     tt = (centers.astype(np.float64) - new_point) @ new_dir
+
+    # A real boundary line is straight; a curved court marking (a service
+    # circle/arc) is not, but Hough can still chain its gently-curving
+    # sub-segments into one "collinear enough" cluster. Measure how far
+    # the actual centreline points stray perpendicular to the straight
+    # fit -- noise/anti-aliasing keeps this to a pixel or two; systematic
+    # curvature grows it well past that, growing with the arc's length.
+    # Checked as a fraction of length rather than a flat pixel cap so it
+    # scales with how much of the arc got captured.
+    perp = (centers.astype(np.float64) - new_point) @ np.array([-new_dir[1], new_dir[0]])
+    length = float(tt.max() - tt.min())
+    if length > 0 and float(np.max(np.abs(perp))) > max(2.0, 0.015*length):
+        return None
+
     thickness = float(np.median(widths))
     return new_point, new_dir, float(tt.min()), float(tt.max()), thickness
+
+
+def _line_coverage_ratio(mask, point, direction, t_min, t_max,
+                          tol=COVERAGE_TOL_PX, gap_bridge_px=COVERAGE_GAP_BRIDGE_PX):
+    """
+    How much of a fitted line is actually painted, as a fraction of its
+    own length — the longest contiguous run of mask hits along it, gaps
+    up to `gap_bridge_px` bridged. 1.0 = solid stripe end to end.
+
+    Used to tell a real boundary line (continuous, bar the odd shadow)
+    from the net's top tape (fragments in the mask — sag, self-shadowing,
+    mesh/background showing through) without relying on appearance around
+    the line, which a glossy, unevenly-lit real floor makes unreliable.
+    """
+    h, w = mask.shape[:2]
+    normal = np.array([-direction[1], direction[0]])
+    length = t_max - t_min
+    if length <= 0:
+        return 0.0
+    step = 1.5
+    ts = np.arange(0.0, length, step)
+    offs = np.arange(-tol, tol + 1)
+
+    hits = []
+    for t in ts:
+        base = point + direction*(t_min + t)
+        xs = np.round(base[0] + normal[0]*offs).astype(int)
+        ys = np.round(base[1] + normal[1]*offs).astype(int)
+        valid = (xs >= 0) & (xs < w) & (ys >= 0) & (ys < h)
+        hit = valid.any() and bool((mask[np.clip(ys,0,h-1), np.clip(xs,0,w-1)][valid] > 0).any())
+        hits.append(hit)
+
+    if not hits:
+        return 0.0
+    gap_bridge = max(1, int(round(gap_bridge_px / step)))
+    best = cur = gap = 0
+    for hit in hits:
+        if hit:
+            cur += 1
+            gap = 0
+        else:
+            gap += 1
+            if gap <= gap_bridge:
+                cur += 1
+            else:
+                best = max(best, cur)
+                cur = 0
+    best = max(best, cur)
+    return (best*step) / length
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -304,19 +399,14 @@ def _dominant_frame_color(frame, exclude_mask):
     return np.median(lab[valid].reshape(-1, 3), axis=0)
 
 
-def _sample_side_color(lab, gray, line_mask, point, direction, normal, sign, t_values, offset):
+def _sample_side_color(lab, line_mask, point, direction, normal, sign, t_values, offset):
     """
-    Returns (median_color, texture) for the sampled side, or (None, None)
-    if no valid sample points were found. `texture` is the mean Laplacian
-    variance across a wider window at each sample point — near-zero for a
-    flat painted surface, high for something with fine structure like net
-    mesh (same edge-energy measure used for frame sharpness elsewhere in
-    this file, just applied locally instead of to the whole frame).
+    Returns the median colour of the sampled side, or None if no valid
+    sample points were found.
     """
-    half      = SAMPLE_PATCH // 2
-    tex_half  = TEXTURE_WINDOW // 2
+    half = SAMPLE_PATCH // 2
     h, w = line_mask.shape[:2]
-    all_px, tex_scores = [], []
+    all_px = []
     for t in t_values:
         base = point + direction*t + normal*sign*offset
         cx, cy = int(base[0]), int(base[1])
@@ -328,48 +418,26 @@ def _sample_side_color(lab, gray, line_mask, point, direction, normal, sign, t_v
         if len(px) == 0:
             continue
         all_px.append(px.reshape(-1, 3))
-
-        if cx-tex_half >= 0 and cy-tex_half >= 0 and cx+tex_half < w and cy+tex_half < h:
-            tex_patch = gray[cy-tex_half:cy+tex_half+1, cx-tex_half:cx+tex_half+1]
-            tex_scores.append(cv2.Laplacian(tex_patch, cv2.CV_64F).var())
     if not all_px:
-        return None, None
-    all_px  = np.concatenate(all_px, axis=0)
-    median  = np.median(all_px, axis=0)
-    # Median, not mean: a sample point near a line intersection (e.g. a
-    # court corner, where a perpendicular line crosses through the texture
-    # window) is a legitimate single-sample outlier, not evidence the
-    # whole side is textured. Median ignores one or two such outliers but
-    # still flags a side where MOST samples show real texture (mesh).
-    texture = float(np.median(tex_scores)) if tex_scores else 0.0
-    return median, texture
+        return None
+    all_px = np.concatenate(all_px, axis=0)
+    return np.median(all_px, axis=0)
 
 
 def _determine_in_side(frame, line_mask, point, direction, t_min, t_max):
     """
-    Returns the unit normal vector pointing toward the IN side, or None
-    if it couldn't be determined — either sample points fell outside the
-    frame, or one side is too visually non-uniform to be a real court-
-    adjacent surface (e.g. the net's mesh, spectators, foliage), in which
-    case this candidate line is rejected outright rather than risked as a
-    boundary.
+    Returns the unit normal vector pointing toward the IN side, or None if
+    it couldn't be determined — sample points fell outside the frame, or
+    both sides read too similarly in colour to call (see below).
     """
     normal   = np.array([-direction[1], direction[0]])
     t_values = np.linspace(t_min, t_max, 9)[1:-1]   # skip noisy extreme ends
     lab      = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB)
-    gray     = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
-    color_pos, tex_pos = _sample_side_color(lab, gray, line_mask, point, direction, normal, +1, t_values, SAMPLE_OFFSET_PX)
-    color_neg, tex_neg = _sample_side_color(lab, gray, line_mask, point, direction, normal, -1, t_values, SAMPLE_OFFSET_PX)
+    color_pos = _sample_side_color(lab, line_mask, point, direction, normal, +1, t_values, SAMPLE_OFFSET_PX)
+    color_neg = _sample_side_color(lab, line_mask, point, direction, normal, -1, t_values, SAMPLE_OFFSET_PX)
     dominant  = _dominant_frame_color(frame, line_mask)
     if color_pos is None or color_neg is None or dominant is None:
-        return None
-
-    if tex_pos > MAX_SIDE_TEXTURE or tex_neg > MAX_SIDE_TEXTURE:
-        print(f"[Calibration] Rejected a candidate line: one side has fine "
-              f"texture, not a flat court surface (texture={tex_pos:.0f}/{tex_neg:.0f}, "
-              f"limit={MAX_SIDE_TEXTURE}) — likely the net's mesh or background "
-              f"clutter, not a floor boundary line.")
         return None
 
     d_pos = np.linalg.norm(color_pos - dominant)
@@ -377,7 +445,7 @@ def _determine_in_side(frame, line_mask, point, direction, t_min, t_max):
 
     if abs(d_pos - d_neg) < 3.0:
         print(f"[Calibration] WARNING: IN/OUT sides look colour-similar "
-              f"(d_pos={d_pos:.1f}, d_neg={d_neg:.1f}) — result may be unreliable.")
+              f"(d_pos={d_pos:.1f}, d_neg={d_neg:.1f}) -- result may be unreliable.")
 
     return normal if d_pos <= d_neg else -normal
 
@@ -413,20 +481,32 @@ def _fit_candidates(frame, hough_threshold):
 
         # Sharpen the fit onto the true painted-line centre + measure its
         # real thickness, so the IN/OUT edge sits exactly on the line.
+        # A failed refinement isn't given a lenient pass on the raw Hough
+        # fit -- it means either too little of the candidate could be
+        # cross-section-validated to trust, or (see _refine_centerline)
+        # it's measurably curved, not straight (a service circle/arc, not
+        # a boundary line). Either way it's dropped, not kept as-is.
         refined = _refine_centerline(mask, point, direction, t_min, t_max)
-        if refined is not None:
-            point, direction, t_min, t_max, thickness = refined
-            margin = min(MAX_MARGIN_PX, max(MIN_MARGIN_PX, thickness / 2.0))
-            p1 = point + direction*t_min
-            p2 = point + direction*t_max
-            endpoints = (tuple(int(v) for v in p1), tuple(int(v) for v in p2))
-            # The refined extent (validated cross-section by cross-section)
-            # is the real length — not the raw Hough cluster's segment sum,
-            # which can overstate it. Using the stale value here corrupted
-            # length-based comparisons downstream (dedup, boundary select).
-            length = t_max - t_min
-        else:
-            margin = DEFAULT_MARGIN_PX
+        if refined is None:
+            continue
+        point, direction, t_min, t_max, thickness = refined
+        margin = min(MAX_MARGIN_PX, max(MIN_MARGIN_PX, thickness / 2.0))
+        p1 = point + direction*t_min
+        p2 = point + direction*t_max
+        endpoints = (tuple(int(v) for v in p1), tuple(int(v) for v in p2))
+        # The refined extent (validated cross-section by cross-section) is
+        # the real length — not the raw Hough cluster's segment sum, which
+        # can overstate it. Using the stale value here corrupted
+        # length-based comparisons downstream (dedup, boundary select).
+        length = t_max - t_min
+
+        coverage = _line_coverage_ratio(mask, point, direction, t_min, t_max)
+        if coverage < MIN_COVERAGE_RATIO:
+            print(f"[Calibration] Rejected a candidate line: only "
+                  f"{coverage*100:.0f}% of its length is continuously "
+                  f"painted (need >={MIN_COVERAGE_RATIO*100:.0f}%) -- "
+                  f"likely the net's top tape, not a floor boundary line.")
+            continue
 
         in_normal = _determine_in_side(frame, mask, point, direction, t_min, t_max)
         if in_normal is None:
@@ -439,7 +519,7 @@ def _fit_candidates(frame, hough_threshold):
     return candidates
 
 
-def _line_position(line):
+def _line_position(line, frame_shape):
     """
     A scalar position along the axis that separates PARALLEL lines of the
     same orientation — y for horizontal lines (near baseline vs. far
@@ -447,34 +527,67 @@ def _line_position(line):
     Used to tell distinct parallel lines apart and find the outermost
     pair.
 
-    Deliberately uses a fixed image-space axis rather than each line's
-    own normal: cv2.fitLine's direction sign is arbitrary per line, so a
-    per-line-derived axis can point opposite ways for two lines of the
-    same orientation and scramble the ordering between them.
+    Evaluated at a FIXED reference (the frame's own centre column/row),
+    not read off the line's raw fitted point. A sideline in this module's
+    target camera placement is often meaningfully diagonal (see
+    _orientation), so its fitted point's x can land anywhere along a wide
+    y-range depending on which sub-segment a particular Hough pass
+    happened to capture -- two detections of the exact same physical
+    sideline, one from its near-net half and one from its near-camera
+    half, would otherwise disagree by however far the line has drifted
+    sideways between those two segments, far more than a real difference
+    between two distinct sidelines. Projecting every candidate to where
+    it crosses the same fixed row/column removes that source of
+    disagreement, so dedup and boundary selection compare apples to
+    apples regardless of which part of the line was actually detected.
     """
-    return float(line['point'][1] if line['orientation'] == 'H' else line['point'][0])
+    h, w = frame_shape[:2]
+    point, direction = line['point'], line['direction']
+    if line['orientation'] == 'H':
+        if abs(direction[0]) < 1e-9:
+            return float(point[1])
+        t = (w/2.0 - point[0]) / direction[0]
+        return float(point[1] + direction[1]*t)
+    else:
+        if abs(direction[1]) < 1e-9:
+            return float(point[0])
+        t = (h/2.0 - point[1]) / direction[1]
+        return float(point[0] + direction[0]*t)
 
 
-def _dedupe_lines(candidates, pos_tol=20):
+MIN_DETECTION_COUNT = 2   # see _dedupe_lines
+
+def _dedupe_lines(candidates, frame_shape, pos_tol=20):
     """
     Merges candidates that are really the same physical line seen more
     than once (different frame/threshold attempts), keeping the longest
     representative of each. Candidates only merge within the same
     orientation and a similar _line_position.
+
+    Also drops any group seen fewer than MIN_DETECTION_COUNT times. A real
+    boundary line is painted the same way in every frame, so it tends to
+    pass at most of the (frame, Hough-threshold) attempts it's actually
+    visible in; a one-off false positive — e.g. a gently curved court
+    marking whose curvature happens to fall inside every per-point check's
+    tolerance only for one unlucky frame's particular lighting/occlusion —
+    typically doesn't repeat. Requiring more than a single sighting costs
+    nothing for a genuinely visible line but filters out that kind of
+    fluke.
     """
-    groups = []   # [{'orientation', 'pos', 'best'}]
+    groups = []   # [{'orientation', 'pos', 'best', 'count'}]
     for cand in candidates:
-        pos = _line_position(cand)
+        pos = _line_position(cand, frame_shape)
         merged = False
         for g in groups:
             if g['orientation'] == cand['orientation'] and abs(pos - g['pos']) < pos_tol:
+                g['count'] += 1
                 if cand['length'] > g['best']['length']:
                     g['best'], g['pos'] = cand, pos
                 merged = True
                 break
         if not merged:
-            groups.append({'orientation': cand['orientation'], 'pos': pos, 'best': cand})
-    return [g['best'] for g in groups]
+            groups.append({'orientation': cand['orientation'], 'pos': pos, 'best': cand, 'count': 1})
+    return [g['best'] for g in groups if g['count'] >= MIN_DETECTION_COUNT]
 
 
 def _motion_center_x(frames, max_frames=150, warmup=30):
@@ -532,6 +645,18 @@ def _select_boundary_lines(candidates, frame_shape, motion_center_x=None):
     available — a much more direct anchor for "this court" than frame
     geometry, since it's literally where the game is being played. Falls
     back to the frame's own centre otherwise (e.g. an empty court, or 'H').
+
+    Before bracketing, drops any candidate under MIN_GROUP_LEN_FRAC of the
+    longest candidate in its own orientation group. A short internal
+    marking (the centre service line, a short service line) can sit
+    closer to the "bracket around centre" anchor point than the real
+    sideline/boundary is — which is exactly backwards, since that anchor
+    exists to prefer THIS court's boundary over a farther-away adjacent
+    court's, not to prefer an internal line over a real one. A genuine
+    boundary is close to the longest thing visible in its orientation;
+    an internal line consistently measures much shorter (observed well
+    under half, in practice) because it doesn't run the court's full
+    visible extent.
     """
     h, w = frame_shape[:2]
     center = {
@@ -539,12 +664,16 @@ def _select_boundary_lines(candidates, frame_shape, motion_center_x=None):
         'V': motion_center_x if motion_center_x is not None else w / 2.0,
     }
 
+    pos = lambda c: _line_position(c, frame_shape)
+
     result = []
     for o in ('H', 'V'):
         group = [c for c in candidates if c['orientation'] == o]
         if not group:
             continue
-        group.sort(key=_line_position)
+        max_len = max(c['length'] for c in group)
+        group = [c for c in group if c['length'] >= MIN_GROUP_LEN_FRAC*max_len]
+        group.sort(key=pos)
 
         if len(group) <= 2:
             result.append(group[0])
@@ -553,12 +682,12 @@ def _select_boundary_lines(candidates, frame_shape, motion_center_x=None):
             continue
 
         c0    = center[o]
-        left  = [g for g in group if _line_position(g) <= c0]
-        right = [g for g in group if _line_position(g) >  c0]
+        left  = [g for g in group if pos(g) <= c0]
+        right = [g for g in group if pos(g) >  c0]
         if left:
-            result.append(max(left, key=_line_position))    # nearest to centre, left/above
+            result.append(max(left, key=pos))    # nearest to centre, left/above
         if right:
-            result.append(min(right, key=_line_position))   # nearest to centre, right/below
+            result.append(min(right, key=pos))   # nearest to centre, right/below
     return result
 
 
@@ -575,15 +704,33 @@ def auto_calibrate(frames, exhaustive=False):
     _select_boundary_lines for how that's told apart from a shared
     multi-court floor's other lines).
 
-    By default only the sharpest few frames are tried (fast — the normal
-    case). With exhaustive=True, every loaded frame is tried at a wider,
-    more sensitive range of Hough thresholds — a slower search used only
-    as a second automatic attempt when the fast pass finds nothing, so
-    manual line placement is never needed.
+    By default only a modest, spread-out sample of frames is tried (fast —
+    the normal case). With exhaustive=True, every loaded frame is tried at
+    a wider, more sensitive range of Hough thresholds — a slower search
+    used only as a second automatic attempt when the fast pass finds
+    nothing, so manual line placement is never needed.
     """
-    print("[AutoCalib] Scanning frames for sharpest …")
-    order = sorted(range(len(frames)), key=lambda i: -_sharpness(frames[i]))
-    top_frames = order if exhaustive else order[:min(5, len(order))]
+    print("[AutoCalib] Scanning frames for sharpest ...")
+    if exhaustive:
+        top_frames = sorted(range(len(frames)), key=lambda i: -_sharpness(frames[i]))
+    else:
+        # The sharpest frames overall tend to cluster in the same short
+        # stretch of the clip (e.g. a moment nobody's mid-stride) — trying
+        # only those risks every sampled frame sharing the same player
+        # position, so a line only unoccluded elsewhere never gets seen at
+        # all. Bucketing across the whole loaded span first, then taking
+        # the sharpest frame per bucket, spreads samples over different
+        # moments (different player positions/occlusion) while still
+        # skipping obviously blurry frames within each one.
+        n_buckets = min(20, len(frames))
+        bucket_edges = np.linspace(0, len(frames), n_buckets + 1).astype(int)
+        top_frames = []
+        for b in range(n_buckets):
+            lo, hi = bucket_edges[b], bucket_edges[b+1]
+            if lo >= hi:
+                continue
+            idxs = range(lo, hi)
+            top_frames.append(max(idxs, key=lambda i: _sharpness(frames[i])))
     thresholds = (60, 45, 32, 22, 15, 10) if exhaustive else (60, 45, 32, 22)
     print(f"[AutoCalib] Trying {len(top_frames)} frame(s)"
           f"{' (exhaustive)' if exhaustive else ': ' + str(top_frames)}")
@@ -602,9 +749,9 @@ def auto_calibrate(frames, exhaustive=False):
     if motion_center_x is not None:
         print(f"[AutoCalib] Player motion centre x={motion_center_x:.0f}")
     else:
-        print("[AutoCalib] No player motion detected — using frame centre")
+        print("[AutoCalib] No player motion detected -- using frame centre")
 
-    deduped = _dedupe_lines(all_candidates)
+    deduped = _dedupe_lines(all_candidates, frames[0].shape)
     lines   = _select_boundary_lines(deduped, frames[0].shape, motion_center_x)
 
     for l in lines:
@@ -693,7 +840,7 @@ def _manual_line_ui(frame):
         if in_normal is None:
             in_normal = np.array([-direction[1], direction[0]])
             print("[Calibration] WARNING: could not auto-detect the IN side by "
-                  "colour for a manually-placed line — defaulted; verify the "
+                  "colour for a manually-placed line -- defaulted; verify the "
                   "IN/OUT overlay looks correct.")
 
         lines.append({
@@ -713,8 +860,8 @@ def calibrate_manual(cap):
     in the app), for footage where automatic detection isn't reliable
     (a shared multi-court floor, heavy glare, etc.).
     """
-    print("\n[Calibration] ── Manual (on-demand) ─────────────────────")
-    print("  Loading a frame …")
+    print("\n[Calibration] -- Manual (on-demand) -------------------------")
+    print("  Loading a frame ...")
 
     cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
     frames = []
@@ -763,8 +910,8 @@ def calibrate(cap):
     unavailable until a later automatic attempt succeeds (e.g. via the
     app's recalibrate key), never via manual line placement.
     """
-    print("\n[Calibration] ──────────────────────────────────────────")
-    print("  Loading frames …")
+    print("\n[Calibration] ------------------------------------------")
+    print("  Loading frames ...")
 
     frames = []
     cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
@@ -779,8 +926,8 @@ def calibrate(cap):
     lines = auto_calibrate(frames)
 
     if not lines:
-        print("[Calibration] Fast pass found nothing — retrying with a wider "
-              "automatic search (every frame, more Hough sensitivities) …")
+        print("[Calibration] Fast pass found nothing -- retrying with a wider "
+              "automatic search (every frame, more Hough sensitivities) ...")
         lines = auto_calibrate(frames, exhaustive=True)
 
     if lines:
@@ -792,7 +939,7 @@ def calibrate(cap):
         return True
 
     print("[Calibration] Automatic detection could not find any boundary line "
-          "in this footage. Continuing uncalibrated — IN/OUT calls are "
+          "in this footage. Continuing uncalibrated -- IN/OUT calls are "
           "unavailable until recalibration succeeds.\n")
     cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
     return False
@@ -879,7 +1026,7 @@ def _save():
     }
     with open(CONFIG_FILE, "w") as f:
         json.dump(data, f, indent=2)
-    print(f"[Calibration] Config saved → {CONFIG_FILE}")
+    print(f"[Calibration] Config saved -> {CONFIG_FILE}")
 
 
 def load_court_points():
@@ -888,7 +1035,7 @@ def load_court_points():
     with open(CONFIG_FILE) as f:
         data = json.load(f)
     if data.get("version") != CONFIG_VERSION:
-        print("[Calibration] Config is an older/incompatible format — recalibrating.")
+        print("[Calibration] Config is an older/incompatible format -- recalibrating.")
         return False
 
     global LINES

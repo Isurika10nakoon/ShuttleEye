@@ -42,7 +42,7 @@ if session is None:
     print("[ShuttleEye] Login cancelled. Exiting.")
     sys.exit(0)
 umpire_name, role = session
-print(f"[ShuttleEye] Logged in as '{umpire_name}' ({role}) — {COURT_NAME}")
+print(f"[ShuttleEye] Logged in as '{umpire_name}' ({role}) -- {COURT_NAME}")
 
 cap = cv2.VideoCapture(VIDEO_SOURCE)
 cap.set(cv2.CAP_PROP_FRAME_WIDTH,  1280)
@@ -137,7 +137,7 @@ while True:
     elif key == ord('s'):
         total, ins, outs = judge.get_stats()
         a, b = dashboard.score_a, dashboard.score_b
-        print(f"[Stats] Score {a}–{b}  | Decisions: {total} total, {ins} IN, {outs} OUT")
+        print(f"[Stats] Score {a}-{b}  | Decisions: {total} total, {ins} IN, {outs} OUT")
 
     elif key == ord('c'):
         # Force a fresh automatic recalibration
@@ -171,7 +171,7 @@ while True:
         cm       = judge.last_landing_cm
         cm_str   = f"({cm[0]:.1f},{cm[1]:.1f})cm" if cm else "?"
         a, b     = dashboard.score_a, dashboard.score_b
-        print(f"[FIRST-TOUCH] px={landing_pt}  {cm_str}  → {decision}   {a}–{b}")
+        print(f"[FIRST-TOUCH] px={landing_pt}  {cm_str}  -> {decision}   {a}-{b}")
 
     # 4. Draw court overlay
     frame = calibration.draw_court(frame)
