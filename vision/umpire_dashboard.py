@@ -39,6 +39,7 @@ import threading
 import time
 import datetime
 import queue
+import webbrowser
 
 import auth
 import db
@@ -85,6 +86,10 @@ class UmpireDashboard:
         self.umpire_name = umpire_name
         self.role        = role
         self.court_name  = court_name
+
+        # Set by app.py once the web dashboard is up, so the desktop
+        # window can open the spectator board in a browser directly.
+        self.web_url = None
 
         # Match format — points needed to win a set (21 or 15), chosen by
         # the umpire before the match starts. Deuce/cap scale with it.
@@ -309,7 +314,10 @@ class UmpireDashboard:
         body = ctk.CTkFrame(root, fg_color=BG, corner_radius=0)
         body.pack(fill="both", expand=True, padx=0, pady=0)
 
-        left  = ctk.CTkFrame(body, fg_color=BG, corner_radius=0)
+        # Scrollable so every control stays reachable even if the window
+        # ends up shorter than the content (small screens, high DPI, etc.)
+        # — content used to silently clip below the visible window.
+        left = ctk.CTkScrollableFrame(body, fg_color=BG, corner_radius=0)
         left.pack(side="left", fill="both", expand=True, padx=14, pady=10)
 
         hidden = ctk.CTkFrame(root, fg_color=BG, corner_radius=0, width=1, height=1)
@@ -467,6 +475,16 @@ class UmpireDashboard:
                   TEXT_DIM, height=30, font_size=10).pack(side="left", expand=True, fill="x", padx=2)
         self._btn(row6, "⚙ Match Format", self._change_match_format,
                   TEXT_DIM, height=30, font_size=10).pack(side="left", expand=True, fill="x", padx=2)
+
+        row7 = ctk.CTkFrame(ctrl, fg_color="transparent");  row7.pack(fill="x", pady=3)
+        self._btn(row7, "📺 Open Spectator Board", self._open_spectator_board,
+                  CYAN, height=30, font_size=10).pack(fill="x", padx=2)
+
+    def _open_spectator_board(self):
+        if not self.web_url:
+            self._flash_decision("Web dashboard isn't running", RED)
+            return
+        webbrowser.open(f"{self.web_url}/board")
 
     # ── Right panel: rally log ────────────────────────────────────
 

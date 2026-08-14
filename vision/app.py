@@ -61,8 +61,10 @@ dashboard.start()   # runs in background thread; non-blocking
 # ── Remote dashboard — lets the umpire's own phone/tablet/laptop view
 #    and control the match over the network, separate from this PC ─────
 web_url = run_web_dashboard(dashboard)
+dashboard.web_url = web_url  # lets the desktop window's "Spectator Board" button open it
 print(f"[ShuttleEye] Remote umpire dashboard: {web_url}")
 print( "[ShuttleEye] Open that address on the umpire's device (same Wi-Fi/network) to log in.")
+print(f"[ShuttleEye] Public spectator scoreboard (no login): {web_url}/board")
 
 # ── Core components ───────────────────────────────────────────────
 def _on_decision(decision, cm, px):

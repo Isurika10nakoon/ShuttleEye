@@ -77,6 +77,34 @@ def create_app(dashboard):
             return redirect(url_for("index"))
         return Response(ADMIN_HTML, mimetype="text/html")
 
+    @app.get("/board")
+    def board_page():
+        # Intentionally public — meant to be left open on a courtside
+        # TV/projector for spectators, no umpire/admin account needed.
+        return Response(BOARD_HTML, mimetype="text/html")
+
+    @app.get("/api/board")
+    def api_board():
+        # Public, read-only subset of the match state — no controls, no
+        # login. Safe to expose: it's the same score anyone courtside
+        # can already see by looking at the players.
+        state = dashboard.get_state()
+        return jsonify({
+            "court_name"  : state["court_name"],
+            "name_a"      : state["name_a"],
+            "name_b"      : state["name_b"],
+            "score_a"     : state["score_a"],
+            "score_b"     : state["score_b"],
+            "sets_a"      : state["sets_a"],
+            "sets_b"      : state["sets_b"],
+            "set_history" : state["set_history"],
+            "serve"       : state["serve"],
+            "set_num"     : state["set_num"],
+            "status"      : state["status"],
+            "winning_score": state["winning_score"],
+            "game_over"   : state["game_over"],
+        })
+
     @app.post("/api/login")
     def api_login():
         data = request.get_json(silent=True) or {}
@@ -371,6 +399,9 @@ PAGE_HTML = f"""<!doctype html><html><head><meta charset="utf-8">
 
 <div class="btn-row">
   <button class="util" style="flex:1" onclick="window.location='/api/export'">💾 Export Log</button>
+  <button class="util" style="flex:1" onclick="window.open('/board','_blank')">📺 Spectator Board</button>
+</div>
+<div class="btn-row">
   <button class="util" style="flex:1" onclick="logout()">🚪 Log Out</button>
 </div>
 </div>
@@ -522,5 +553,84 @@ async function logout(){{
 
 refresh();
 setInterval(refresh, 2000);
+</script>
+</body></html>"""
+
+BOARD_HTML = """<!doctype html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+<title>ShuttleEye — Scoreboard</title>
+<style>
+:root{color-scheme:dark;}
+*{box-sizing:border-box;}
+html,body{height:100%;margin:0;background:#0d1117;color:#e6edf3;
+          font-family:'Segoe UI',system-ui,sans-serif;overflow:hidden;
+          -webkit-tap-highlight-color:transparent;}
+.board{height:100vh;display:flex;flex-direction:column;align-items:center;
+       justify-content:center;padding:2vh 3vw;text-align:center;cursor:none;}
+.court{font-size:2.4vw;color:#8b949e;letter-spacing:.06em;margin-bottom:1vh;}
+.format{font-size:1.6vw;color:#58a6ff;font-weight:bold;margin-bottom:3vh;}
+.score-row{display:flex;align-items:center;justify-content:center;width:100%;gap:3vw;}
+.col{flex:1;display:flex;flex-direction:column;align-items:center;min-width:0;}
+.name{font-size:3.2vw;font-weight:bold;margin-bottom:1vh;
+      overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:95%;}
+.name.a{color:#58a6ff;} .name.b{color:#f0883e;}
+.score{font-size:16vw;font-weight:bold;line-height:1;}
+.score.a{color:#58a6ff;} .score.b{color:#f0883e;}
+.score.serving{color:#fff;text-shadow:0 0 40px currentColor;}
+.dash{font-size:8vw;color:#30363d;padding:0 1vw;}
+.serve{font-size:1.8vw;color:#d29922;margin-top:3vh;min-height:1.4em;}
+.status{font-size:2.2vw;color:#d29922;font-weight:bold;margin-top:1vh;min-height:1.3em;}
+.sets{font-size:1.6vw;color:#8b949e;margin-top:2vh;}
+.setHistory{font-size:1.1vw;color:#8b949e;margin-top:.6vh;font-family:Consolas,monospace;}
+.hint{position:fixed;bottom:10px;right:14px;font-size:.75rem;color:#30363d;}
+.gameover{font-size:3vw;color:#3fb950;font-weight:bold;margin-top:2vh;}
+</style></head>
+<body>
+<div class="board" id="board" onclick="goFullscreen()">
+  <div class="court" id="court">🏸 SHUTTLEEYE</div>
+  <div class="format" id="format">Race to 21</div>
+  <div class="score-row">
+    <div class="col"><div class="name a" id="nameA">Player A</div>
+      <div class="score a" id="scoreA">0</div></div>
+    <div class="dash">–</div>
+    <div class="col"><div class="name b" id="nameB">Player B</div>
+      <div class="score b" id="scoreB">0</div></div>
+  </div>
+  <div class="serve" id="serve"></div>
+  <div class="status" id="status"></div>
+  <div class="sets" id="sets"></div>
+  <div class="setHistory" id="setHistory"></div>
+</div>
+<div class="hint">tap anywhere for fullscreen</div>
+<script>
+function goFullscreen(){
+  if (!document.fullscreenElement) document.documentElement.requestFullscreen().catch(()=>{});
+}
+
+async function refresh(){
+  try{
+    const res = await fetch('/api/board');
+    const s = await res.json();
+    document.getElementById('court').textContent = '🏸 ' + s.court_name.toUpperCase();
+    document.getElementById('format').textContent = 'Race to ' + s.winning_score;
+    document.getElementById('nameA').textContent = s.name_a;
+    document.getElementById('nameB').textContent = s.name_b;
+    document.getElementById('scoreA').textContent = s.score_a;
+    document.getElementById('scoreB').textContent = s.score_b;
+    document.getElementById('scoreA').className = 'score a' + (s.serve==='A' ? ' serving' : '');
+    document.getElementById('scoreB').className = 'score b' + (s.serve==='B' ? ' serving' : '');
+    const servingName = s.serve === 'A' ? s.name_a : s.name_b;
+    document.getElementById('serve').textContent = s.game_over ? '' : ('🏸 Serving: ' + servingName);
+    document.getElementById('status').textContent = s.status || '';
+    document.getElementById('sets').textContent =
+      'Sets — ' + s.name_a + ': ' + s.sets_a + '    ' + s.name_b + ': ' + s.sets_b;
+    document.getElementById('setHistory').textContent = s.set_history.length
+      ? s.set_history.map((p,i) => 'Set'+(i+1)+': '+p[0]+'–'+p[1]).join('     ')
+      : 'Set ' + s.set_num + ' in progress';
+  } catch(e) { /* transient network hiccup — just retry next tick */ }
+}
+
+refresh();
+setInterval(refresh, 1500);
 </script>
 </body></html>"""
