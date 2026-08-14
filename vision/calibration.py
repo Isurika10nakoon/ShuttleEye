@@ -590,13 +590,19 @@ def _dedupe_lines(candidates, frame_shape, pos_tol=20):
     return [g['best'] for g in groups if g['count'] >= MIN_DETECTION_COUNT]
 
 
-def _motion_center_x(frames, max_frames=150, warmup=30):
+def _motion_center(frames, max_frames=150, warmup=30):
     """
-    Rough horizontal centre of player activity — used to anchor which pair
-    of sidelines belongs to the court actually in play, on a shared
-    multi-court floor where several courts' sidelines can all be visible
-    at once. Returns None if no real motion is found (e.g. an empty
-    court), so callers can fall back to frame geometry.
+    Rough centre (x, y) of player activity -- literally where the game is
+    being played. Used two ways: to anchor which pair of sidelines belongs
+    to the court actually in play on a shared multi-court floor (the x
+    component), and to sanity-check/correct each selected boundary line's
+    IN direction (both components) -- the court interior necessarily
+    contains wherever the players actually are, which is a far more
+    reliable signal than comparing colours across a line, especially for
+    a line near the edge of the frame where both sides are plain court
+    surface and colour has almost nothing to go on (see
+    _select_boundary_lines). Returns None if no real motion is found (e.g.
+    an empty court), so callers can fall back to frame geometry.
 
     MOG2 needs a run of CONSECUTIVE frames to build a stable background
     model — feeding it a sparse/decimated sample starves it of that and
@@ -609,23 +615,69 @@ def _motion_center_x(frames, max_frames=150, warmup=30):
     backSub = cv2.createBackgroundSubtractorMOG2(
         history=max(warmup, 1), varThreshold=40, detectShadows=False)
 
-    xs, weights = [], []
+    xs, ys, weights = [], [], []
     for i in range(n):
         fg = backSub.apply(frames[i])
         if i < warmup:
             continue   # let the model converge before trusting its output
         _, fg = cv2.threshold(fg, 200, 255, cv2.THRESH_BINARY)
-        xs_idx = np.nonzero(fg)[1]
+        ys_idx, xs_idx = np.nonzero(fg)
         if len(xs_idx) > 50:   # ignore near-empty/noise frames
             xs.append(float(np.mean(xs_idx)))
+            ys.append(float(np.mean(ys_idx)))
             weights.append(len(xs_idx))
 
     if not xs:
         return None
-    return float(np.average(xs, weights=weights))
+    return (float(np.average(xs, weights=weights)),
+            float(np.average(ys, weights=weights)))
 
 
-def _select_boundary_lines(candidates, frame_shape, motion_center_x=None):
+def _collapse_same_side(group, pos, c0):
+    """
+    Collapses candidates that agree on which direction is IN down to just
+    the outermost (rearmost) one.
+
+    Two lines of the same orientation are only a genuine near/far (or
+    left/right) pair if they disagree about which side is IN -- that's
+    what it means for them to be opposite edges of the court. If two
+    candidates' normals point the SAME way, they're not opposite edges,
+    just two lines on the same side (e.g. a service line short of the
+    real back boundary, or a duplicate detection). The area inside a line
+    is IN and outside it is OUT, so when two lines on the same side both
+    got kept, the space between them was being called OUT by the nearer
+    one even though the rearmost line is the one that actually bounds the
+    court -- only the area beyond THAT should read OUT.
+
+    Picks the survivor by POSITION (further from the group's centre
+    anchor `c0`, via the same `pos` used for bracketing), not by asking
+    each candidate's own normal which one "permits the larger region".
+    That would sound right but isn't robust here: this situation is
+    specifically two lines that are BOTH bordered by plain court floor on
+    both sides (that's exactly why they read as agreeing on IN direction
+    in the first place), which is the one case the colour-based IN/OUT
+    check has the least to go on -- so its output is the one signal we
+    shouldn't lean on to break the tie. Position doesn't have that
+    problem: a real boundary is, by construction, the most extreme
+    marking on the court, and an internal line (service line, centre
+    line) always sits closer to the middle -- true regardless of which
+    way either line's own normal ended up pointing.
+    """
+    kept = []
+    for cand in group:
+        merged = False
+        for i, k in enumerate(kept):
+            if np.dot(cand['normal'], k['normal']) > 0.5:
+                if abs(pos(cand) - c0) > abs(pos(k) - c0):
+                    kept[i] = cand
+                merged = True
+                break
+        if not merged:
+            kept.append(cand)
+    return kept
+
+
+def _select_boundary_lines(candidates, frame_shape, motion_center=None):
     """
     Keeps only the boundary of THIS court per orientation.
 
@@ -640,8 +692,8 @@ def _select_boundary_lines(candidates, frame_shape, motion_center_x=None):
     multiple courts' width, not just this one's. Instead, bracket a
     centre point with the nearest line on each side of it.
 
-    For the sidelines ('V'), that centre point is the horizontal centre
-    of where players are actually seen moving (motion_center_x), when
+    For the sidelines ('V'), that centre point is the horizontal component
+    of where players are actually seen moving (motion_center), when
     available — a much more direct anchor for "this court" than frame
     geometry, since it's literally where the game is being played. Falls
     back to the frame's own centre otherwise (e.g. an empty court, or 'H').
@@ -657,8 +709,32 @@ def _select_boundary_lines(candidates, frame_shape, motion_center_x=None):
     an internal line consistently measures much shorter (observed well
     under half, in practice) because it doesn't run the court's full
     visible extent.
+
+    After picking this court's line(s) for the orientation, runs
+    _collapse_same_side over just that pick. Deliberately not run any
+    earlier: two lines from DIFFERENT courts on a shared floor can easily
+    share a normal direction too (e.g. two courts' left sidelines both
+    have "IN" pointing the same way), and collapsing on that basis before
+    the bracket step would silently undo the multi-court disambiguation
+    above, keeping whichever court's line is most extreme instead of THIS
+    court's. Once narrowed to this court's own candidate(s), a leftover
+    same-direction pair can only mean one thing: a nearer line short of
+    the true rearmost boundary on the very side already selected.
+
+    Finally, for every kept line, corrects its IN-side normal against
+    motion_center if the two disagree: the court interior necessarily
+    contains wherever the players actually are, so if a line's own
+    colour-based normal puts that point on the OUT side, the normal was
+    wrong, not the player. This matters most for exactly the line that's
+    hardest for colour to call correctly -- a boundary near the edge of
+    the frame, where both sides are the same plain court surface and the
+    colour-similarity comparison has very little to go on (see
+    _sample_side_color) -- which is also, not coincidentally, the most
+    consequential line to get backwards: the outer boundary that decides
+    IN vs. OUT for real shots.
     """
     h, w = frame_shape[:2]
+    motion_center_x = motion_center[0] if motion_center is not None else None
     center = {
         'H': h / 2.0,
         'V': motion_center_x if motion_center_x is not None else w / 2.0,
@@ -671,23 +747,30 @@ def _select_boundary_lines(candidates, frame_shape, motion_center_x=None):
         group = [c for c in candidates if c['orientation'] == o]
         if not group:
             continue
+        c0 = center[o]
         max_len = max(c['length'] for c in group)
         group = [c for c in group if c['length'] >= MIN_GROUP_LEN_FRAC*max_len]
         group.sort(key=pos)
 
         if len(group) <= 2:
-            result.append(group[0])
-            if len(group) > 1:
-                result.append(group[-1])
-            continue
+            chosen = [group[0]] if len(group) == 1 else [group[0], group[-1]]
+        else:
+            left  = [g for g in group if pos(g) <= c0]
+            right = [g for g in group if pos(g) >  c0]
+            chosen = []
+            if left:
+                chosen.append(max(left, key=pos))    # nearest to centre, left/above
+            if right:
+                chosen.append(min(right, key=pos))   # nearest to centre, right/below
 
-        c0    = center[o]
-        left  = [g for g in group if pos(g) <= c0]
-        right = [g for g in group if pos(g) >  c0]
-        if left:
-            result.append(max(left, key=pos))    # nearest to centre, left/above
-        if right:
-            result.append(min(right, key=pos))   # nearest to centre, right/below
+        result.extend(_collapse_same_side(chosen, pos, c0))
+
+    if motion_center is not None:
+        mc = np.array(motion_center, dtype=np.float64)
+        for line in result:
+            if np.dot(mc - line['point'], line['normal']) < 0:
+                line['normal'] = -line['normal']
+
     return result
 
 
@@ -745,14 +828,14 @@ def auto_calibrate(frames, exhaustive=False):
         print("[AutoCalib] No boundary line found across attempts.")
         return []
 
-    motion_center_x = _motion_center_x(frames)
-    if motion_center_x is not None:
-        print(f"[AutoCalib] Player motion centre x={motion_center_x:.0f}")
+    motion_center = _motion_center(frames)
+    if motion_center is not None:
+        print(f"[AutoCalib] Player motion centre x={motion_center[0]:.0f} y={motion_center[1]:.0f}")
     else:
         print("[AutoCalib] No player motion detected -- using frame centre")
 
     deduped = _dedupe_lines(all_candidates, frames[0].shape)
-    lines   = _select_boundary_lines(deduped, frames[0].shape, motion_center_x)
+    lines   = _select_boundary_lines(deduped, frames[0].shape, motion_center)
 
     for l in lines:
         print(f"[AutoCalib] {l['orientation']} boundary line "
@@ -765,12 +848,15 @@ def auto_calibrate(frames, exhaustive=False):
 #  own; only used when the app explicitly asks for it, e.g. a keybinding)
 # ═══════════════════════════════════════════════════════════════════════
 
-def _manual_line_ui(frame):
+def _manual_line_ui(frame, motion_center=None):
     """
     Click up to 2 lines (2 points each). ENTER confirms after the 2nd or
     4th point placed — so a single visible line still works, but a corner
     view can capture both. The IN side of each clicked line is still
-    worked out automatically from colour, never asked for.
+    worked out automatically from colour, never asked for -- and, when
+    motion_center is available, corrected against it the same way an
+    auto-detected line is (see _select_boundary_lines): the court
+    interior necessarily contains wherever the players actually are.
     """
     pts = []
     win = "Calibration (click 2 points per line — up to 2 lines)"
@@ -842,6 +928,10 @@ def _manual_line_ui(frame):
             print("[Calibration] WARNING: could not auto-detect the IN side by "
                   "colour for a manually-placed line -- defaulted; verify the "
                   "IN/OUT overlay looks correct.")
+        if motion_center is not None:
+            mc = np.array(motion_center, dtype=np.float64)
+            if np.dot(mc - point, in_normal) < 0:
+                in_normal = -in_normal
 
         lines.append({
             'point': point, 'direction': direction, 'normal': in_normal,
@@ -874,7 +964,8 @@ def calibrate_manual(cap):
         raise RuntimeError("No frames available for calibration.")
 
     best_idx = int(np.argmax([_sharpness(f) for f in frames]))
-    lines = _manual_line_ui(frames[best_idx])
+    motion_center = _motion_center(frames)
+    lines = _manual_line_ui(frames[best_idx], motion_center)
 
     ok = bool(lines)
     if ok:
