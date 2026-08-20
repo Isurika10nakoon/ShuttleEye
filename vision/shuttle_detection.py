@@ -21,21 +21,30 @@ from collections import deque
 class ShuttleDetector:
 
     TRAIL_LEN  = 24
-    MIN_AREA   = 12
-    MAX_AREA   = 700
+    MIN_AREA   = 8
+    MAX_AREA   = 900       # widened: motion blur during fast flight
+                            # (smashes/clears) elongates the blob's area
     MIN_ASPECT = 0.2
     MAX_ASPECT = 4.5
 
     # Shuttlecocks are white/near-white — reject blobs that are too dark
     # or too saturated (players' skin, clothing, rackets, shoes, court
     # markings) even if they happen to match the shuttle's size/shape.
-    MIN_BRIGHTNESS = 150   # HSV V channel
-    MAX_SATURATION = 90    # HSV S channel
+    # Loosened from (150, 90): motion blur while the shuttle is airborne
+    # dulls its brightness and blends in some background colour, and the
+    # stricter gate was killing a large fraction of genuine in-flight
+    # detections (measured on test footage — see shuttle_detection notes).
+    MIN_BRIGHTNESS = 120   # HSV V channel
+    MAX_SATURATION = 110   # HSV S channel
 
     # Once a shuttle is being tracked, reject candidate blobs that appear
     # far from where the trail predicts the shuttle should be — this is
     # what stops the detector from "jumping" onto a nearby player/racket.
-    MAX_JUMP_PX  = 220
+    # Widened from 220: a shuttle in flight (especially on a smash) can
+    # easily cover more than 220px between frames, which was the single
+    # largest cause of dropped in-flight detections — the correct blob
+    # was being found and then rejected for "moving too fast".
+    MAX_JUMP_PX  = 400
     MAX_MISSED   = 10   # frames of no match before the track is dropped
 
     def __init__(self):
@@ -48,11 +57,27 @@ class ShuttleDetector:
         self.trail    = deque(maxlen=self.TRAIL_LEN)
         self.missed   = 0
 
-    def _predict_next(self):
-        """Linear extrapolation from the last two trail points."""
+    def _predict_next(self, frame_shape):
+        """
+        Linear extrapolation from the last two trail points.
+
+        A shuttle changes direction sharply on every hit and at the top
+        of its arc, so this extrapolation can overshoot far outside the
+        frame right when it matters most. Trusting a wild prediction
+        there would reject the real (but suddenly-reversed) detection as
+        "too far away", which then starves the trail and compounds the
+        problem on the next frame too. So: fall back to the last known
+        position — an unmoving gate — whenever the extrapolation isn't
+        even plausibly still in view.
+        """
         if len(self.trail) >= 2:
             (x0, y0), (x1, y1) = self.trail[-2], self.trail[-1]
-            return (2*x1 - x0, 2*y1 - y0)
+            px, py = 2*x1 - x0, 2*y1 - y0
+            h, w = frame_shape[:2]
+            margin = 150
+            if -margin <= px <= w + margin and -margin <= py <= h + margin:
+                return (px, py)
+            return self.trail[-1]
         if self.trail:
             return self.trail[-1]
         return None
@@ -77,7 +102,7 @@ class ShuttleDetector:
             mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
         )
 
-        predicted = self._predict_next()
+        predicted = self._predict_next(frame.shape)
 
         shuttle_pos = None   # bottom-centre (x, y_bottom)
         shuttle_ctr = None   # centre (for trail)
