@@ -75,7 +75,8 @@ import json
 import numpy as np
 import os
 
-CONFIG_FILE = "court_config.json"
+_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+CONFIG_FILE = os.path.join(_PROJECT_ROOT, "court_config.json")
 CONFIG_VERSION = 8   # multi-line schema + per-line measured margin
 
 # Tolerance around a line: a shuttle touching the line counts as IN.

@@ -11,7 +11,7 @@
 import hashlib
 import secrets
 
-import db
+from core import db
 
 PBKDF2_ROUNDS = 200_000
 
