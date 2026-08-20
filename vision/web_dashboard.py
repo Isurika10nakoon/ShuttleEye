@@ -381,6 +381,8 @@ h1{font-size:1.2rem;color:#58a6ff;margin:0;}
 .vs{color:#8b949e;font-size:1.4rem;padding:0 8px;}
 .status{text-align:center;color:#d29922;font-weight:bold;min-height:1.4em;margin-top:4px;}
 .serve-line{text-align:center;color:#d29922;font-size:.85rem;margin-top:4px;}
+.line-call{text-align:center;font-weight:bold;font-size:1.4rem;min-height:1.5em;margin-top:6px;}
+.line-call.in{color:#3fb950;} .line-call.out{color:#f85149;}
 .meta{display:flex;justify-content:space-between;font-size:.8rem;color:#8b949e;padding:6px 4px;}
 .btn-row{display:flex;gap:8px;margin-bottom:8px;}
 button{flex:1;border:none;border-radius:12px;padding:16px 8px;font-size:1.05rem;font-weight:bold;
@@ -500,6 +502,7 @@ PAGE_HTML = f"""<!doctype html><html><head><meta charset="utf-8">
       <div class="score b" id="scoreB">0</div></div>
   </div>
   <div class="serve-line" id="serveLine">🏸 Serving: —</div>
+  <div class="line-call" id="lineCall"></div>
   <div class="status" id="status"></div>
 </div>
 
@@ -552,6 +555,16 @@ async function refresh(){{
   document.getElementById('scoreB').className = 'score b' + (s.serve==='B' ? ' serving' : '');
   const servingName = s.serve === 'A' ? s.name_a : s.name_b;
   document.getElementById('serveLine').textContent = '🏸 Serving: ' + servingName;
+
+  const lineCallEl = document.getElementById('lineCall');
+  if (s.last_decision && s.decision_age !== null && s.decision_age < 3) {{
+    lineCallEl.textContent = 'Line call: ' + s.last_decision;
+    lineCallEl.className = 'line-call ' + s.last_decision.toLowerCase();
+  }} else {{
+    lineCallEl.textContent = '';
+    lineCallEl.className = 'line-call';
+  }}
+
   document.getElementById('status').textContent = s.status || '';
   document.getElementById('formatLabel').textContent = '🎯 Race to ' + s.winning_score;
   const badge = document.getElementById('roleBadge');

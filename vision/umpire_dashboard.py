@@ -112,6 +112,9 @@ class UmpireDashboard:
         self.name_b      = "Player B"
         self._start_time = time.time()
         self._last_decision = None     # (decision, cm, px)
+        self._last_decision_time = None  # time.time() it arrived — lets any
+                                          # thread (e.g. the web dashboard)
+                                          # tell whether it's still "fresh"
         self._set_num    = 1
         self.status_text = ""          # plain-Python mirror of _status_var,
                                         # safe to read from any thread (e.g.
@@ -212,6 +215,11 @@ class UmpireDashboard:
             "winning_score"  : self.winning_score,
             "elapsed_seconds": int(time.time() - self._start_time),
             "last_decision"  : self._last_decision[0] if self._last_decision else None,
+            # Seconds since that line call arrived — lets a remote viewer
+            # show it as a fresh "flash" and then let it fade, mirroring
+            # this desktop window's own 2.5s decision flash.
+            "decision_age"   : (time.time() - self._last_decision_time)
+                                if self._last_decision_time is not None else None,
         }
 
     def export_log_text(self):
@@ -617,6 +625,7 @@ class UmpireDashboard:
         decides whether/how to award the point via the Point A/B buttons.
         """
         self._last_decision = (decision, cm, px)
+        self._last_decision_time = time.time()
         color = GREEN if decision == "IN" else RED
         self._flash_decision(f"Line call: {decision}", color)
 
