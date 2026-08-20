@@ -13,7 +13,7 @@
 
 import random
 
-import db
+from core import db
 
 
 def _next_pow2(n):

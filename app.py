@@ -16,18 +16,19 @@ import time
 import os
 import sys
 
-from shuttle_detection  import ShuttleDetector
-from landing_detection  import LandingDetector
-from line_judge         import LineJudge
-from umpire_dashboard   import UmpireDashboard
-from login_window       import run_login_flow
-from web_dashboard      import run_web_dashboard  
-import calibration
-import auth
-import db
+from vision.shuttle_detection  import ShuttleDetector
+from vision.landing_detection  import LandingDetector
+from vision.line_judge         import LineJudge
+from desktop.umpire_dashboard  import UmpireDashboard
+from desktop.login_window      import run_login_flow
+from web.web_dashboard         import run_web_dashboard
+from vision import calibration
+from core import auth
+from core import db
 
 # ── Config ───────────────────────────────────────────────────────
-VIDEO_SOURCE = "videos/test4.mp4"  # 0 for webcam
+PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
+VIDEO_SOURCE = os.path.join(PROJECT_ROOT, "videos", "test4.mp4")  # 0 for webcam
 COURT_NAME   = os.environ.get("COURT_NAME", "Court 1")  # shown to the
                                                           # admin's multi-court view
 # ─────────────────────────────────────────────────────────────────

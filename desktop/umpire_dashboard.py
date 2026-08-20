@@ -41,9 +41,9 @@ import datetime
 import queue
 import webbrowser
 
-import auth
-import db
-import bracket
+from core import auth
+from core import db
+from core import bracket
 
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("blue")

@@ -22,9 +22,9 @@ import threading
 
 from flask import Flask, jsonify, request, session, redirect, url_for, Response
 
-import auth
-import db
-import bracket
+from core import auth
+from core import db
+from core import bracket
 
 DEFAULT_PORT = 8080
 
