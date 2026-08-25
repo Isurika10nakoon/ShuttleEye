@@ -47,6 +47,18 @@ class ShuttleDetector:
     MAX_JUMP_PX  = 400
     MAX_MISSED   = 10   # frames of no match before the track is dropped
 
+    # A real shuttle is always accelerating under gravity/drag — it never
+    # hovers in mid-air. If the "best" match sits within STUCK_RADIUS_PX of
+    # where it was STUCK_FRAMES ago, every single frame, that's not a
+    # shuttle in flight; it's a static-ish background object (a player's
+    # hand, racket grip, or shirt near the net) that happens to satisfy the
+    # colour/shape gates and keeps winning because it's close to the last
+    # trail point. MAX_MISSED can't catch this: a (wrong) match is found
+    # every frame, so the track never looks "lost". This is a separate
+    # staleness guard that drops the trail once a lock stops moving.
+    STUCK_RADIUS_PX = 20
+    STUCK_FRAMES     = 10   # ~1/3s at 30fps
+
     def __init__(self):
         self.backSub = cv2.createBackgroundSubtractorMOG2(
             history=120,
@@ -56,6 +68,9 @@ class ShuttleDetector:
         self.kernel   = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
         self.trail    = deque(maxlen=self.TRAIL_LEN)
         self.missed   = 0
+
+        self._stuck_anchor = None  # position the current lock is measured from
+        self._stuck_count  = 0     # consecutive frames within STUCK_RADIUS_PX
 
     def _predict_next(self, frame_shape):
         """
@@ -144,6 +159,30 @@ class ShuttleDetector:
                 shuttle_ctr = ctr
 
         # ── Trail (use centre for smooth visual path) ─────────────
+        if shuttle_ctr:
+            # ── Staleness guard: is this lock actually moving? ────
+            if self._stuck_anchor is None:
+                self._stuck_anchor = shuttle_ctr
+                self._stuck_count  = 0
+            elif np.hypot(shuttle_ctr[0]-self._stuck_anchor[0],
+                          shuttle_ctr[1]-self._stuck_anchor[1]) <= self.STUCK_RADIUS_PX:
+                self._stuck_count += 1
+            else:
+                self._stuck_anchor = shuttle_ctr
+                self._stuck_count  = 0
+
+            if self._stuck_count >= self.STUCK_FRAMES:
+                # Locked onto something that isn't moving like a shuttle —
+                # drop the trail so prediction-based gating stops favouring
+                # this spot, and the next frame can freely re-acquire the
+                # real shuttle anywhere in the image.
+                self.trail.clear()
+                shuttle_ctr = None
+                shuttle_pos = None
+                best_box    = None
+                self._stuck_anchor = None
+                self._stuck_count  = 0
+
         if shuttle_ctr:
             self.trail.append(shuttle_ctr)
             self.missed = 0
