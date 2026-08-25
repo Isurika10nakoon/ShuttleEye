@@ -1,16 +1,34 @@
 # landing_detection.py
 # ═══════════════════════════════════════════════════════════════════
-#  FIRST-TOUCH landing detector
+#  FIRST-TOUCH (ground-only) landing detector
 #
-#  Goal: fire the decision at the EXACT frame the shuttle first
-#        contacts the ground — not after the bounce, not after it
-#        stops, but at impact frame zero.
+#  Goal: fire the decision the moment the shuttle first contacts the
+#        COURT FLOOR — and only the floor. A racket/player contact
+#        must never be reported as a landing.
 #
-#  How it works (3-layer pipeline)
+#  Why "did it bounce back up" is the WRONG signal
+#  ─────────────────────────────────────────────────
+#  A badminton shuttlecock has very high drag and almost no
+#  coefficient of restitution: it does not rebound off the court, it
+#  just stops (a soft "plop"), possibly with a small roll. A clean
+#  rebound after the lowest point of a fall — the shuttle rising
+#  again with real speed — is the signature of a RACKET/PLAYER
+#  contact, not the floor. So this detector does NOT treat "bounced
+#  back up" as ground contact. It only fires on genuine ground
+#  contact's real signature: the shuttle was clearly falling, and its
+#  speed then collapses to near-zero instead of continuing to move.
+#  A racket redirect keeps (or increases) speed, so it fails this
+#  check and is correctly ignored — tracking simply continues into
+#  whatever the shuttle does next.
+#
+#  How it works (2-layer pipeline)
 #  ────────────────────────────────
 #  Layer 1 — Kalman filter (4-state: x, y, vx, vy)
 #    Smooths noisy detections and gives clean velocity estimates.
-#    Bridges up to GAP_TOLERANCE missing frames via prediction.
+#    Bridges up to GAP_TOLERANCE missing frames via prediction, but
+#    the extrapolated point is never treated as a real observation
+#    (see update() — it never enters positions/velocities and can
+#    never itself trigger a decision).
 #
 #  Layer 2 — Trajectory phase classifier
 #    Each frame is tagged as one of:
@@ -18,32 +36,14 @@
 #      ASCENDING   → vy < -VY_THRESH  (moving up  = decreasing y)
 #      FLAT        → |vy| ≤ VY_THRESH (horizontal / near net)
 #
-#  Layer 3 — First-touch triggers (in priority order)
-#
-#    A) IMPACT-FRAME DETECTION (highest priority)
-#       During descent, track the bottom-most y reached so far.
-#       The moment detected y rises MORE than IMPACT_RISE_PX pixels
-#       above that bottom (the shuttle is already bouncing back up),
-#       report the saved bottom point — that IS the first-touch frame.
-#       This catches the exact impact because:
-#         • Before impact: y increases each frame (shuttle falling)
-#         • At impact:     y is maximum (lowest physical point)
-#         • After impact:  y decreases (shuttle bouncing up)
-#       We report as soon as we confirm the direction reversed.
-#
-#    B) VELOCITY SIGN FLIP (vy crosses zero)
-#       Kalman vy flips from positive → negative.
-#       We store the position from ONE frame before the flip
-#       (that is the ground contact frame, not the first rising frame).
-#
-#    C) SPEED COLLAPSE after confirmed descent
-#       If total speed drops below STOP_THRESHOLD after the shuttle
-#       was clearly descending. Catches shuttles that land softly
-#       and do not bounce visibly.
-#
-#  All three triggers report the LOWEST y seen in the recent window,
-#  not the current position, so the decision is always at the actual
-#  ground level even when triggered one frame late.
+#  Layer 3 — Ground-contact trigger
+#    While descending, the lowest y reached so far is tracked as the
+#    candidate floor point. Once a CONFIRMED descent (>= MIN_DESCENT
+#    frames) ends, if total speed stays below STOP_THRESHOLD for
+#    STOP_CONFIRM_FRAMES consecutive frames, that candidate point is
+#    reported as the landing. If speed does not collapse (racket
+#    redirect), the streak resets and no decision fires — the
+#    tracker just keeps watching for the next real descent.
 # ═══════════════════════════════════════════════════════════════════
 
 import cv2
@@ -64,13 +64,13 @@ class LandingDetector:
 
     # ── Tuning constants ─────────────────────────────────────────
     HISTORY_LEN     = 30    # smoothed positions kept
-    MIN_DESCENT     = 5     # frames of descent before triggers arm
+    MIN_DESCENT     = 5     # frames of descent before the trigger arms
     GAP_TOLERANCE   = 5     # frames of missing detection to bridge
     COOLDOWN        = 40    # frames locked after a decision
 
-    VY_THRESH       = 1.5   # px/frame — min vy to be "moving"
-    STOP_THRESHOLD  = 5.0   # px/frame — "stopped" speed
-    IMPACT_RISE_PX  = 3     # px rise above floor_y to confirm bounce
+    VY_THRESH        = 1.5  # px/frame — min vy to be "moving"
+    STOP_THRESHOLD   = 5.0  # px/frame — "stopped" speed (ground contact)
+    STOP_CONFIRM_FRAMES = 2 # consecutive low-speed frames required to fire
 
     # Kalman noise tuning
     PROC_NOISE      = 5e-3
@@ -92,8 +92,15 @@ class LandingDetector:
         # First-touch tracker
         self._floor_y      = -1    # lowest y seen during current descent
         self._floor_pos    = None  # position at that lowest y
-        self._prev_pos     = None  # position one frame ago (for vy sign flip)
-        self._prev_vy      = 0.0
+
+        # Ground-contact confirmation state
+        self._was_confirmed_descent = False  # confirmed descent, prev frame
+        self._stop_streak           = 0      # consecutive low-speed frames
+
+        # True only on frames where shuttle_pos came from a real detection,
+        # not a gap-bridged Kalman extrapolation. Triggers must never fire
+        # on a fabricated position.
+        self._last_measured = False
 
     # ── Kalman setup ─────────────────────────────────────────────
 
@@ -157,62 +164,70 @@ class LandingDetector:
         if shuttle_pos is not None:
             self.gap_count = 0
             spos, vel = self._kf_step(shuttle_pos)
+            self.positions.append(spos)
+            self.velocities.append(vel)
+            self._update_phase(vel[1])   # vy
+            self._last_measured = True
         else:
             self.gap_count += 1
+            self._last_measured = False
             if self.gap_count <= self.GAP_TOLERANCE and self._kf_ready:
-                spos, vel = self._kf_predict_only()
-                if spos is None:
-                    return
+                # Keep the Kalman filter's internal clock ticking across the
+                # gap so its state stays time-consistent, but do NOT feed the
+                # extrapolated point into positions/velocities/phase — a
+                # fabricated (never actually seen) position must never arm
+                # or fire a landing trigger.
+                self._kf_predict_only()
             else:
                 # Too many missing frames — reset descent tracker
                 self._reset_descent()
-                return
-
-        self.positions.append(spos)
-        self.velocities.append(vel)
-        self._update_phase(vel[1])   # vy
 
     def detect_landing(self):
         """
-        Returns first-touch (x, y) pixel coordinates, or None.
-        Call once per frame immediately after update().
+        Returns first-touch (x, y) pixel coordinates on the FLOOR, or None.
+        Call once per frame immediately after update(). Never fires on a
+        racket/player redirect — only on a confirmed descent whose speed
+        collapses to near-zero (see module docstring for why).
         """
-        if self.cooldown > 0 or len(self.positions) < self.MIN_DESCENT:
+        if (self.cooldown > 0 or len(self.positions) < self.MIN_DESCENT
+                or not self._last_measured):
+            self._stop_streak = 0
             return None
 
-        vy  = self.velocities[-1][1]
-        pos = self.positions[-1]
+        vx, vy = self.velocities[-1]
+        pos    = self.positions[-1]
+        spd    = math.hypot(vx, vy)
 
-        # ── Arm: require confirmed descent ──────────────────────
-        if self.phase != Phase.DESCENDING:
-            return None
+        is_descending     = self.phase == Phase.DESCENDING
+        confirmed_descent = is_descending and self.descent_count >= self.MIN_DESCENT
 
-        # Track the deepest (highest y) point during descent
-        if pos[1] > self._floor_y:
+        # Track the deepest (highest y) point reached during this descent —
+        # that is the actual ground-contact pixel, reported even if the
+        # trigger confirms a frame or two later.
+        if is_descending and pos[1] > self._floor_y:
             self._floor_y   = pos[1]
             self._floor_pos = pos
 
         landing = None
 
-        # ── Trigger A: impact-frame detection ───────────────────
-        # Shuttle has risen IMPACT_RISE_PX above the floor → it bounced
-        if (self._floor_pos is not None and
-                self._floor_y > 0 and
-                pos[1] < self._floor_y - self.IMPACT_RISE_PX):
-            landing = self._floor_pos
-
-        # ── Trigger B: Kalman vy sign flip ───────────────────────
-        # vy was positive (descending), now negative (ascending)
-        elif (self._prev_vy > self.VY_THRESH and
-              vy < -self.VY_THRESH):
-            # Report the position from one frame ago (last descending frame)
-            landing = self._prev_pos if self._prev_pos else self._floor_pos
-
-        # ── Trigger C: speed collapse after descent ──────────────
-        elif self.descent_count >= self.MIN_DESCENT:
-            spd = math.hypot(*self.velocities[-1])
+        # Only evaluate the stop condition once we've had (or are still
+        # inside) a confirmed descent — this is what "just left descent"
+        # means without depending on this-frame's phase label directly,
+        # since the Kalman-smoothed phase can flip within the same frame.
+        if self._was_confirmed_descent or self._stop_streak > 0:
             if spd < self.STOP_THRESHOLD:
+                self._stop_streak += 1
+            else:
+                # Speed did not collapse — a racket redirect, not ground
+                # contact. Reject and keep tracking normally.
+                self._stop_streak = 0
+
+            if self._stop_streak >= self.STOP_CONFIRM_FRAMES:
                 landing = self._floor_pos if self._floor_pos else pos
+        else:
+            self._stop_streak = 0
+
+        self._was_confirmed_descent = confirmed_descent
 
         # ── Fire decision ────────────────────────────────────────
         if landing is not None:
@@ -220,9 +235,6 @@ class LandingDetector:
             self._reset_descent()
             return landing
 
-        # Store previous for next frame's sign-flip check
-        self._prev_pos = pos
-        self._prev_vy  = vy
         return None
 
     # ── Internal helpers ─────────────────────────────────────────
@@ -246,11 +258,11 @@ class LandingDetector:
             self.descent_count = 0
 
     def _reset_descent(self):
-        self.descent_count = 0
-        self._floor_y      = -1
-        self._floor_pos    = None
-        self._prev_pos     = None
-        self._prev_vy      = 0.0
+        self.descent_count          = 0
+        self._floor_y               = -1
+        self._floor_pos             = None
+        self._was_confirmed_descent = False
+        self._stop_streak           = 0
 
     # ── Debug info ───────────────────────────────────────────────
 
